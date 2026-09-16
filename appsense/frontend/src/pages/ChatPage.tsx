@@ -3,6 +3,7 @@ import Markdown from "react-markdown";
 import { useParams, useSearchParams } from "react-router-dom";
 import {
   api,
+  AllowCommand,
   CommandProposal,
   Conversation,
   Message,
@@ -22,6 +23,11 @@ function slashQuery(value: string) {
   return value.slice(1).toLowerCase();
 }
 
+function commandQuery(value: string) {
+  if (!value.startsWith("@") || value.includes("\n") || value.includes(" ")) return null;
+  return value.slice(1).toLowerCase();
+}
+
 type ChatMsg = {
   role: string;
   content: string;
@@ -35,22 +41,55 @@ export function ChatPage() {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [activity, setActivity] = useState("");
   const [proposal, setProposal] = useState<CommandProposal | null>(null);
+  const [actionRequest, setActionRequest] = useState("");
+  const [activeSkillRun, setActiveSkillRun] = useState(false);
   const [cmdOutput, setCmdOutput] = useState("");
+  const [cmdSummary, setCmdSummary] = useState("");
   const [running, setRunning] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [commands, setCommands] = useState<AllowCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
+  const [commandIndex, setCommandIndex] = useState(0);
   const [mode, setMode] = useState<"chat" | "support">("chat");
   const bottom = useRef<HTMLDivElement>(null);
   const historyRef = useRef<HTMLDivElement>(null);
+  const actionController = useRef<AbortController | null>(null);
+
+  function stopAction() {
+    actionController.current?.abort();
+    actionController.current = null;
+  }
 
   async function loadConversations(select?: string) {
     if (!projectId) return;
     const list = await api<Conversation[]>(`/api/projects/${projectId}/conversations`);
     setConversations(list);
+    setHistoryError("");
     if (select) setActiveId(select);
+  }
+
+  async function toggleHistory() {
+    if (historyOpen) {
+      setHistoryOpen(false);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      await loadConversations();
+      setHistoryOpen(true);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not load recent chats");
+      setHistoryOpen(true);
+    } finally {
+      setHistoryLoading(false);
+    }
   }
 
   async function openConversation(id: string) {
@@ -69,11 +108,20 @@ export function ChatPage() {
 
   async function newChat() {
     if (!projectId) return;
+    stopAction();
+    setBusy(false);
+    setRunning(false);
     const conv = await api<Conversation>(`/api/projects/${projectId}/conversations`, {
       method: "POST",
     });
     setActiveId(conv.id);
     setMessages([]);
+    setProposal(null);
+    setActionRequest("");
+    setActiveSkillRun(false);
+    setCmdOutput("");
+    setCmdSummary("");
+    setTerminalOpen(false);
     setHistoryOpen(false);
     await loadConversations(conv.id);
   }
@@ -82,11 +130,19 @@ export function ChatPage() {
     loadConversations().catch(console.error);
     setMessages([]);
     setActiveId(null);
+    setProposal(null);
+    setActionRequest("");
+    setActiveSkillRun(false);
+    setCmdOutput("");
+    setCmdSummary("");
+    setTerminalOpen(false);
     setHistoryOpen(false);
     setHistoryQuery("");
     setSkills([]);
+    setCommands([]);
     if (projectId) {
       api<Skill[]>(`/api/projects/${projectId}/skills`).then(setSkills).catch(console.error);
+      api<AllowCommand[]>(`/api/projects/${projectId}/commands`).then(setCommands).catch(console.error);
     }
   }, [projectId]);
 
@@ -95,8 +151,10 @@ export function ChatPage() {
     if (!projectId || !skillId) return;
     api<Skill>(`/api/projects/${projectId}/skills/${skillId}`)
       .then((skill) => {
+        if (!skill.compiled || !skill.tested) return;
         setInput(`/${skillSlug(skill.name)} `);
         setMode("support");
+        setActiveSkillRun(true);
         setSearchParams({}, { replace: true });
       })
       .catch(console.error);
@@ -125,6 +183,7 @@ export function ChatPage() {
   }, [historyOpen]);
 
   const slash = mode === "support" ? slashQuery(input) : null;
+  const command = mode === "support" ? commandQuery(input) : null;
   const slashMatches = useMemo(() => {
     if (slash === null) return [];
     return skills.filter((s) => {
@@ -133,9 +192,18 @@ export function ChatPage() {
     });
   }, [skills, slash]);
 
+  const commandMatches = useMemo(() => {
+    if (command === null) return [];
+    return commands.filter((c) => {
+      const hay = `${c.name} ${skillSlug(c.name)} ${c.description}`.toLowerCase();
+      return command === "" || hay.includes(command) || skillSlug(c.name).startsWith(command);
+    });
+  }, [commands, command]);
+
   useEffect(() => {
     setSlashIndex(0);
-  }, [slash]);
+    setCommandIndex(0);
+  }, [slash, command]);
 
   const historyGroups = useMemo(() => {
     const needle = historyQuery.trim().toLowerCase();
@@ -161,18 +229,47 @@ export function ChatPage() {
     setSlashIndex(0);
   }
 
+  function applyCommand(commandItem: AllowCommand) {
+    setInput(`@${skillSlug(commandItem.name)} `);
+    setCommandIndex(0);
+  }
+
   async function send(e?: FormEvent) {
     e?.preventDefault();
     if (!projectId || !input.trim() || busy) return;
     const text = input.trim();
+    if (mode === "support" && text.startsWith("/")) setActiveSkillRun(true);
     setInput("");
+    if (mode === "support" && text.startsWith("@")) {
+      const selected = commands.find(
+        (item) => skillSlug(item.name) === text.slice(1).toLowerCase() || item.name.toLowerCase() === text.slice(1).toLowerCase()
+      );
+      if (selected) {
+        setMessages((m) => [...m, { role: "user", content: text }]);
+        setProposal({
+          id: selected.id,
+          name: selected.name,
+          description: selected.description,
+          command: selected.command,
+          cwd: selected.cwd,
+          reason: "Selected from the approved command list.",
+        });
+        setActionRequest(text);
+        setTerminalOpen(false);
+        return;
+      }
+    }
     setMessages((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
     setBusy(true);
+    setActivity("thinking");
+    const controller = new AbortController();
+    actionController.current = controller;
     try {
       const res = await fetch(`/api/projects/${projectId}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ conversation_id: activeId, message: text, mode }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error(await res.text());
       await readSse(res, (event) => {
@@ -180,6 +277,7 @@ export function ChatPage() {
           setActiveId(event.id);
         }
         if (event.type === "token" && typeof event.text === "string") {
+          setActivity("writing response");
           setMessages((m) => {
             const copy = [...m];
             const last = copy[copy.length - 1];
@@ -190,6 +288,8 @@ export function ChatPage() {
           });
         }
         if (event.type === "command_proposal" && event.command) {
+          setActivity("preparing action");
+          setActionRequest("");
           setProposal(event.command as CommandProposal);
         }
         if (event.type === "error" && typeof event.text === "string") {
@@ -204,15 +304,68 @@ export function ChatPage() {
         }
       });
       await loadConversations();
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
     } finally {
+      if (actionController.current === controller) actionController.current = null;
       setBusy(false);
+      setActivity("");
+    }
+  }
+
+  async function continueSkill() {
+    if (!projectId || !activeId || !activeSkillRun || busy) return;
+    const text = "Continue the active tested skill from the next step. Use the last command result to decide whether to proceed or skip optional steps. Do not ask me for a response unless an explicit command confirmation is required.";
+    setBusy(true);
+    setActivity("continuing skill");
+    const controller = new AbortController();
+    actionController.current = controller;
+    setMessages((current) => [...current, { role: "assistant", content: "" }]);
+    let responseText = "";
+    try {
+      const res = await fetch(`/api/projects/${projectId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversation_id: activeId, message: text, mode: "support" }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await readSse(res, (event) => {
+        if (event.type === "command_proposal" && event.command) {
+          setActivity("preparing next action");
+          setProposal(event.command as CommandProposal);
+          setTerminalOpen(false);
+        }
+        if (event.type === "token" && typeof event.text === "string") {
+          setActivity("writing response");
+          responseText += event.text;
+          setMessages((current) => {
+            const copy = [...current];
+            const last = copy[copy.length - 1];
+            if (last?.role === "assistant") copy[copy.length - 1] = { ...last, content: responseText };
+            return copy;
+          });
+        }
+      });
+      await loadConversations();
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+    } finally {
+      if (actionController.current === controller) actionController.current = null;
+      setBusy(false);
+      setActivity("");
     }
   }
 
   async function confirmRun() {
     if (!projectId || !proposal) return;
     setRunning(true);
+    setActivity("running command");
     setCmdOutput("");
+    setCmdSummary("");
+    setTerminalOpen(false);
+    const controller = new AbortController();
+    actionController.current = controller;
     try {
       const res = await fetch(`/api/projects/${projectId}/commands/run`, {
         method: "POST",
@@ -220,19 +373,113 @@ export function ChatPage() {
         body: JSON.stringify({
           command_id: proposal.id,
           conversation_id: activeId,
+          request_text: actionRequest || undefined,
         }),
+        signal: controller.signal,
       });
       await readSse(res, (event) => {
         if (event.type === "output" && typeof event.text === "string") {
           setCmdOutput((s) => s + event.text);
         }
+        if (event.type === "status" && typeof event.text === "string") {
+          setCmdOutput((s) => `${s}${event.text}\n`);
+        }
+        if (event.type === "exit" && typeof event.code === "number") {
+          setCmdOutput((s) => `${s}Process exited with code ${event.code}.\n`);
+        }
+        if (event.type === "summary" && typeof event.text === "string") {
+          setActivity("summarizing result");
+          setCmdSummary(event.text);
+        }
         if (event.type === "error" && typeof event.text === "string") {
           setCmdOutput((s) => s + event.text);
         }
       });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
     } finally {
+      if (actionController.current === controller) actionController.current = null;
       setRunning(false);
+      setActivity("");
+      setProposal(null);
+      setCmdOutput("");
+      setCmdSummary("");
+      setTerminalOpen(false);
+      setActionRequest("");
       if (activeId) await openConversation(activeId);
+      if (activeSkillRun && !controller.signal.aborted) await continueSkill();
+    }
+  }
+
+  async function approveDraft() {
+    if (!projectId || !proposal?.draft) return;
+    const command = await api<AllowCommand>(`/api/projects/${projectId}/commands`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: proposal.name,
+        description: proposal.description,
+        cwd: proposal.cwd,
+        command: proposal.command,
+      }),
+    });
+    setProposal({ ...proposal, id: command.id, draft: false });
+  }
+
+  async function runDraftOnce() {
+    if (!projectId || !proposal?.draft) return;
+    setRunning(true);
+    setActivity("running command");
+    setCmdOutput("");
+    setCmdSummary("");
+    setTerminalOpen(false);
+    const controller = new AbortController();
+    actionController.current = controller;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/commands/run-once`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: proposal.name,
+          description: proposal.description,
+          command: proposal.command,
+          cwd: proposal.cwd,
+          conversation_id: activeId,
+          request_text: actionRequest || undefined,
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      await readSse(res, (event) => {
+        if (event.type === "output" && typeof event.text === "string") {
+          setCmdOutput((s) => s + event.text);
+        }
+        if (event.type === "status" && typeof event.text === "string") {
+          setCmdOutput((s) => `${s}${event.text}\n`);
+        }
+        if (event.type === "exit" && typeof event.code === "number") {
+          setCmdOutput((s) => `${s}Process exited with code ${event.code}.\n`);
+        }
+        if (event.type === "summary" && typeof event.text === "string") {
+          setActivity("summarizing result");
+          setCmdSummary(event.text);
+        }
+        if (event.type === "error" && typeof event.text === "string") {
+          setCmdOutput((s) => s + event.text);
+        }
+      });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+    } finally {
+      if (actionController.current === controller) actionController.current = null;
+      setRunning(false);
+      setActivity("");
+      setProposal(null);
+      setCmdOutput("");
+      setCmdSummary("");
+      setTerminalOpen(false);
+      setActionRequest("");
+      if (activeId) await openConversation(activeId);
+      if (activeSkillRun && !controller.signal.aborted) await continueSkill();
     }
   }
 
@@ -260,9 +507,9 @@ export function ChatPage() {
             <button
               type="button"
               className="subtle"
-              onClick={() => setHistoryOpen((open) => !open)}
+              onClick={toggleHistory}
             >
-              Recents
+              {historyLoading ? "Loading..." : "Recents"}
             </button>
             {historyOpen && (
               <div className="history-panel">
@@ -274,9 +521,14 @@ export function ChatPage() {
                   autoFocus
                 />
                 <div className="history-scroll">
+                  {historyError && <p className="muted history-error">{historyError}</p>}
                   {historyGroups.length === 0 && (
                     <p className="muted" style={{ padding: "8px 10px", margin: 0 }}>
-                      {conversations.length === 0 ? "No chats yet" : "No matching chats"}
+                      {historyError
+                        ? "Recent chats could not be loaded"
+                        : conversations.length === 0
+                          ? "No chats yet"
+                          : "No matching chats"}
                     </p>
                   )}
                   {historyGroups.map((group) => (
@@ -310,7 +562,7 @@ export function ChatPage() {
       <div className="messages">
         {messages.length === 0 && (
           <div className="empty">
-            <h3>How can I help with this app?</h3>
+            <p className="empty-prompt">How can I help with this app?</p>
           </div>
         )}
         {messages.map((m, i) => (
@@ -319,7 +571,11 @@ export function ChatPage() {
               <div className="bubble">{m.content}</div>
             ) : (
               <div className="markdown">
-                <Markdown>{m.content || (busy && i === messages.length - 1 ? "…" : "")}</Markdown>
+                {m.content ? (
+                  <Markdown>{m.content}</Markdown>
+                ) : busy && i === messages.length - 1 ? (
+                  <span className="activity-label">{activity}</span>
+                ) : null}
               </div>
             )}
           </div>
@@ -352,14 +608,56 @@ export function ChatPage() {
             )}
           </div>
         )}
-        <div className="composer-box">
+        {command !== null && (
+          <div className="slash-menu command-menu">
+            <div className="slash-menu-label">Approved commands</div>
+            {commandMatches.length === 0 ? (
+              <p className="muted" style={{ margin: 0, padding: "6px 10px" }}>
+                {commands.length === 0 ? "No approved commands yet" : "No matching command"}
+              </p>
+            ) : (
+              commandMatches.map((item, i) => (
+                <button
+                  type="button"
+                  key={item.id}
+                  className={i === commandIndex ? "active" : ""}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applyCommand(item);
+                  }}
+                >
+                  <strong>@{skillSlug(item.name)}</strong>
+                  <span>{item.description || item.command}</span>
+                </button>
+              ))
+            )}
+          </div>
+        )}
+        <div className={`composer-box ${busy || running || input.trim() ? "processing" : ""}`}>
           <textarea
             placeholder={
-              mode === "support" ? "Message AppSense…  Type / for skills" : "Message AppSense…"
+              mode === "support" ? "Message AppSense…  Type / for skills or @ for commands" : "Message AppSense…"
             }
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
+              if (command !== null && commandMatches.length > 0) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setCommandIndex((i) => (i + 1) % commandMatches.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setCommandIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                  e.preventDefault();
+                  applyCommand(commandMatches[commandIndex]);
+                  return;
+                }
+              }
               if (slash !== null && slashMatches.length > 0) {
                 if (e.key === "ArrowDown") {
                   e.preventDefault();
@@ -388,32 +686,73 @@ export function ChatPage() {
               }
             }}
           />
-          <button className="primary" disabled={busy || !input.trim()}>
-            Send
-          </button>
+          {busy ? (
+            <button
+              type="button"
+              className="stop-action"
+              onClick={stopAction}
+              aria-label="Stop response"
+              title="Stop response"
+            >
+              <span aria-hidden />
+            </button>
+          ) : (
+            <button className="primary" disabled={!input.trim()}>
+              Send
+            </button>
+          )}
         </div>
       </form>
       {proposal && (
-        <div className="modal-backdrop">
-          <div className="modal">
-            <h3>Run allowlisted command?</h3>
-            <p className="muted">
-              {proposal.name}
-              {proposal.reason ? ` — ${proposal.reason}` : ""}
-            </p>
-            <p className="muted">cwd: {proposal.cwd}</p>
-            <pre>{proposal.command}</pre>
-            {cmdOutput && <pre>{cmdOutput}</pre>}
-            <div className="row" style={{ justifyContent: "flex-end", marginTop: 12 }}>
-              <button className="subtle" onClick={() => setProposal(null)} disabled={running}>
-                Cancel
-              </button>
-              <button className="primary" onClick={confirmRun} disabled={running}>
-                {running ? "Running…" : "Confirm run"}
-              </button>
+        <section className="support-action" aria-label="Support action">
+          <div className="support-action-head">
+            <div>
+              <span className="support-action-kicker">{running ? "Running terminal" : "Action proposed"}</span>
+              <h3>{proposal.name}</h3>
             </div>
+            <button className="subtle" onClick={() => { setProposal(null); setActionRequest(""); }} disabled={running}>
+              Dismiss
+            </button>
           </div>
-        </div>
+          {proposal.reason && <p className="muted">{proposal.reason}</p>}
+          {proposal.description && <p>{proposal.description}</p>}
+          <div className="support-command-meta">Working directory: {proposal.cwd}</div>
+          <pre className="support-command">{proposal.command}</pre>
+          <div className="support-action-controls">
+            <button
+              type="button"
+              className="terminal-toggle"
+              onClick={() => setTerminalOpen((open) => !open)}
+              aria-expanded={terminalOpen}
+            >
+              <span className={`terminal-dot ${running ? "live" : ""}`} />
+              Terminal {running ? "running" : "output"}
+              <span aria-hidden>{terminalOpen ? "⌃" : "⌄"}</span>
+            </button>
+            {running ? (
+              <button
+                type="button"
+                className="stop-action"
+                onClick={stopAction}
+                aria-label="Stop command"
+                title="Stop command"
+              >
+                <span aria-hidden />
+              </button>
+            ) : proposal.draft ? (
+              <>
+                <button className="subtle" onClick={approveDraft}>Save for future</button>
+                <button className="primary" onClick={runDraftOnce}>Approve & run once</button>
+              </>
+            ) : (
+              <button className="primary" onClick={confirmRun}>Confirm run</button>
+            )}
+          </div>
+          {terminalOpen && (
+            <pre className="terminal-output">{cmdOutput || "Waiting for command output..."}</pre>
+          )}
+          {cmdSummary && <p className="command-summary">{cmdSummary}</p>}
+        </section>
       )}
     </div>
   );

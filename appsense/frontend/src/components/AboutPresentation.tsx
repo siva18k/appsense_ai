@@ -242,7 +242,8 @@ export function AboutPresentation() {
         <header className="deck-top">
           <div className="deck-brand">
             <BrandMark size={26} className="deck-mark" />
-            AppSense <span className="brand-ai">ai</span>
+            <span className="brand-app">App</span><span className="brand-sense">Sense</span>{" "}
+            <span className="brand-ai">ai</span>
           </div>
           <span className="deck-count">
             {index + 1} / {SLIDES.length}

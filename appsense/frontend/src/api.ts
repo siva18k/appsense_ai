@@ -67,6 +67,11 @@ export type Settings = {
   sqlite_path: string;
   has_api_key: boolean;
   env_path: string;
+  default_command_cwd: string;
+  default_command_python: string;
+  target_app_root: string;
+  target_app_python: string;
+  target_app_env_file: string;
 };
 
 export type CommandProposal = {
@@ -76,6 +81,7 @@ export type CommandProposal = {
   command: string;
   cwd: string;
   reason?: string;
+  draft?: boolean;
 };
 
 export type Skill = {
@@ -88,6 +94,10 @@ export type Skill = {
   summary?: string;
   created_at: string;
   updated_at: string;
+  compiled: boolean;
+  tested: boolean;
+  test_output?: string;
+  tested_at?: string | null;
 };
 
 async function parseError(res: Response): Promise<string> {
@@ -132,6 +142,16 @@ export async function readSse(
         onEvent(JSON.parse(line.slice(5).trim()));
       } catch {
         /* ignore partial json */
+      }
+    }
+  }
+  if (buf.trim()) {
+    const line = buf.split("\n").find((l) => l.startsWith("data:"));
+    if (line) {
+      try {
+        onEvent(JSON.parse(line.slice(5).trim()));
+      } catch {
+        /* ignore incomplete final json */
       }
     }
   }

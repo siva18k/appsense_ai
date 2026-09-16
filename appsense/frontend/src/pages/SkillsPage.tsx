@@ -14,6 +14,10 @@ export type Skill = {
   excerpt?: string;
   created_at: string;
   updated_at: string;
+  compiled: boolean;
+  tested: boolean;
+  test_output?: string;
+  tested_at?: string | null;
 };
 
 export function SkillsPage() {
@@ -28,6 +32,8 @@ export function SkillsPage() {
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [editing, setEditing] = useState<Skill | null>(null);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testMessage, setTestMessage] = useState("");
 
   async function load() {
     if (!projectId) return;
@@ -123,6 +129,24 @@ export function SkillsPage() {
     }
   }
 
+  async function testExisting(skill: Skill) {
+    if (!projectId) return;
+    setTestingId(skill.id);
+    setTestMessage("");
+    setError("");
+    try {
+      const result = await api<Skill>(`/api/projects/${projectId}/skills/${skill.id}/test`, {
+        method: "POST",
+      });
+      setSkills((current) => current.map((item) => (item.id === result.id ? result : item)));
+      setTestMessage(result.test_output || "Skill test completed.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Skill test failed");
+    } finally {
+      setTestingId(null);
+    }
+  }
+
   return (
     <>
       <div className="topbar">
@@ -135,6 +159,7 @@ export function SkillsPage() {
           app’s knowledge, code, and allowlisted commands.
         </p>
         {error && <p className="muted">{error}</p>}
+        {testMessage && <p className="skill-test-result">{testMessage}</p>}
 
         <div className="card kb-composer">
           <form
@@ -230,8 +255,11 @@ export function SkillsPage() {
                     <div className="muted">
                       {s.refined ? "AI-refined playbook" : "Saved as written"}
                       {" · "}
+                      {s.tested ? "Test passed" : "Not tested"}
+                      {" · "}
                       Updated {new Date(s.updated_at).toLocaleString()}
                     </div>
+                    {s.test_output && <div className="muted">{s.test_output}</div>}
                   </div>
                   <div className="kb-card-actions">
                     <button
@@ -251,9 +279,13 @@ export function SkillsPage() {
                     </button>
                     <button
                       className="primary"
+                      disabled={!s.tested || busy}
                       onClick={() => navigate(`/projects/${projectId}/chat?skill=${s.id}`)}
                     >
                       Use in chat
+                    </button>
+                    <button className="subtle" disabled={busy} onClick={() => testExisting(s)}>
+                      {testingId === s.id ? "Testing…" : "Test skill"}
                     </button>
                     <button
                       className="danger"
@@ -283,6 +315,7 @@ export function SkillsPage() {
                         style={{ minHeight: 100 }}
                       />
                       <label>Playbook</label>
+                      <p className="muted">Save edits before testing. Only saved, tested playbooks can run in Chat.</p>
                       <textarea
                         value={current.body}
                         onChange={(e) => setEditing({ ...current, body: e.target.value })}

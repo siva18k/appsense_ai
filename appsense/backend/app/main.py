@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import commands as command_mod
 from . import db as database
-from .chat import stream_chat
+from .chat import stream_chat, summarize_command_output
 from .ingest_code import add_local_repo, add_remote_repo, delete_repo_vectors, index_repo
 from .ingest_kb import (
     create_pdf_doc,
@@ -33,6 +33,7 @@ from .skills import (
     refine_skill,
     reindex_project_skills,
     save_skill,
+    test_skill,
 )
 from .paths import ensure_data_dirs
 from .settings import get_settings, public_settings_dict, update_env
@@ -76,7 +77,7 @@ class RepoRemoteIn(BaseModel):
 class CommandIn(BaseModel):
     name: str
     description: str = ""
-    cwd: str
+    cwd: str = ""
     command: str
 
 
@@ -104,6 +105,11 @@ class SettingsIn(BaseModel):
     embedding_model: str | None = None
     chroma_path: str | None = None
     sqlite_path: str | None = None
+    default_command_cwd: str | None = None
+    default_command_python: str | None = None
+    target_app_root: str | None = None
+    target_app_python: str | None = None
+    target_app_env_file: str | None = None
 
 
 class ChatIn(BaseModel):
@@ -115,6 +121,16 @@ class ChatIn(BaseModel):
 class RunCommandIn(BaseModel):
     command_id: str
     conversation_id: str | None = None
+    request_text: str | None = None
+
+
+class RunDraftCommandIn(BaseModel):
+    name: str
+    description: str = ""
+    command: str
+    cwd: str
+    conversation_id: str | None = None
+    request_text: str | None = None
 
 
 def _project(project_id: str) -> dict[str, Any]:
@@ -123,6 +139,13 @@ def _project(project_id: str) -> dict[str, Any]:
     if not row:
         raise HTTPException(404, "Project not found")
     return dict(row)
+
+
+def _conversation_title(message: str) -> str:
+    title = " ".join(message.split()).strip()
+    if len(title) > 60:
+        return f"{title[:57].rstrip()}..."
+    return title or "New chat"
 
 
 @app.get("/api/health")
@@ -144,6 +167,11 @@ def put_settings(body: SettingsIn):
         "embedding_model": "EMBEDDING_MODEL",
         "chroma_path": "CHROMA_PATH",
         "sqlite_path": "SQLITE_PATH",
+        "default_command_cwd": "DEFAULT_COMMAND_CWD",
+        "default_command_python": "DEFAULT_COMMAND_PYTHON",
+        "target_app_root": "TARGET_APP_ROOT",
+        "target_app_python": "TARGET_APP_PYTHON",
+        "target_app_env_file": "TARGET_APP_ENV_FILE",
     }
     updates = {}
     for field, env_key in mapping.items():
@@ -156,7 +184,7 @@ def put_settings(body: SettingsIn):
 @app.get("/api/projects")
 def list_projects():
     with database.db() as conn:
-        rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+        rows = conn.execute("SELECT * FROM projects ORDER BY created_at ASC").fetchall()
     return database.rows_to_list(rows)
 
 
@@ -209,10 +237,29 @@ def list_conversations(project_id: str):
     _project(project_id)
     with database.db() as conn:
         rows = conn.execute(
-            "SELECT * FROM conversations WHERE project_id = ? ORDER BY created_at DESC",
+                        """SELECT c.* FROM conversations c
+                             WHERE c.project_id = ?
+                                 AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+                             ORDER BY c.created_at DESC""",
             (project_id,),
         ).fetchall()
-    return database.rows_to_list(rows)
+        conversations = database.rows_to_list(rows)
+        for conversation in conversations:
+            if conversation["title"] != "New chat":
+                continue
+            message = conn.execute(
+                """SELECT content FROM messages
+                   WHERE conversation_id = ? AND role = 'user'
+                   ORDER BY created_at ASC LIMIT 1""",
+                (conversation["id"],),
+            ).fetchone()
+            if message:
+                conversation["title"] = _conversation_title(message["content"])
+                conn.execute(
+                    "UPDATE conversations SET title = ? WHERE id = ?",
+                    (conversation["title"], conversation["id"]),
+                )
+    return conversations
 
 
 @app.post("/api/projects/{project_id}/conversations")
@@ -271,13 +318,21 @@ async def chat(project_id: str, body: ChatIn):
                VALUES (?, ?, 'user', ?, NULL, ?)""",
             (database.new_id(), conversation_id, body.message, database.now_iso()),
         )
+        conn.execute(
+            "UPDATE conversations SET title = ? WHERE id = ? AND title = 'New chat'",
+            (_conversation_title(body.message), conversation_id),
+        )
 
     async def events():
         yield _sse({"type": "conversation", "id": conversation_id})
         async for event in stream_chat(project, conversation_id, body.message, body.mode):
             yield _sse(event)
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.get("/api/projects/{project_id}/knowledge")
@@ -532,6 +587,15 @@ def patch_skill(project_id: str, skill_id: str, body: SkillIn):
         raise HTTPException(404, str(exc)) from exc
 
 
+@app.post("/api/projects/{project_id}/skills/{skill_id}/test")
+def test_skill_endpoint(project_id: str, skill_id: str):
+    _project(project_id)
+    try:
+        return test_skill(project_id, skill_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 @app.delete("/api/projects/{project_id}/skills/{skill_id}")
 def remove_skill(project_id: str, skill_id: str):
     _project(project_id)
@@ -638,6 +702,7 @@ def add_command(project_id: str, body: CommandIn):
     _project(project_id)
     cid = database.new_id()
     created = database.now_iso()
+    cwd = body.cwd.strip() or str(get_settings().target_app_root)
     with database.db() as conn:
         conn.execute(
             """INSERT INTO command_allowlist (id, project_id, name, description, cwd, command, created_at)
@@ -647,7 +712,7 @@ def add_command(project_id: str, body: CommandIn):
                 project_id,
                 body.name.strip(),
                 body.description.strip(),
-                body.cwd.strip(),
+                cwd,
                 body.command.strip(),
                 created,
             ),
@@ -666,9 +731,32 @@ def delete_command(project_id: str, command_id: str):
     return {"ok": True}
 
 
+@app.patch("/api/projects/{project_id}/commands/{command_id}")
+def update_command(project_id: str, command_id: str, body: CommandIn):
+    _project(project_id)
+    cwd = body.cwd.strip() or str(get_settings().target_app_root)
+    with database.db() as conn:
+        updated = conn.execute(
+            """UPDATE command_allowlist
+               SET name = ?, description = ?, cwd = ?, command = ?
+               WHERE id = ? AND project_id = ?""",
+            (
+                body.name.strip(),
+                body.description.strip(),
+                cwd,
+                body.command.strip(),
+                command_id,
+                project_id,
+            ),
+        ).rowcount
+    if not updated:
+        raise HTTPException(404, "Command not found")
+    return command_mod.get_command(project_id, command_id)
+
+
 @app.post("/api/projects/{project_id}/commands/run")
 async def run_command(project_id: str, body: RunCommandIn):
-    _project(project_id)
+    project = _project(project_id)
     cmd = command_mod.get_command(project_id, body.command_id)
     if not cmd:
         raise HTTPException(404, "Command not allowlisted")
@@ -676,6 +764,12 @@ async def run_command(project_id: str, body: RunCommandIn):
     conversation_id = body.conversation_id
     if conversation_id:
         with database.db() as conn:
+            if body.request_text:
+                conn.execute(
+                    """INSERT INTO messages (id, conversation_id, role, content, extra_json, created_at)
+                       VALUES (?, ?, 'user', ?, NULL, ?)""",
+                    (database.new_id(), conversation_id, body.request_text, database.now_iso()),
+                )
             conn.execute(
                 """INSERT INTO messages (id, conversation_id, role, content, extra_json, created_at)
                    VALUES (?, ?, 'system', ?, ?, ?)""",
@@ -690,11 +784,16 @@ async def run_command(project_id: str, body: RunCommandIn):
 
     async def events():
         chunks: list[str] = []
+        exit_code = None
         async for event in command_mod.run_allowlisted(cmd):
             if event.get("type") == "output":
                 chunks.append(event.get("text") or "")
+            if event.get("type") == "exit":
+                exit_code = event.get("code")
             yield _sse(event)
         output = "".join(chunks)
+        summary = await summarize_command_output(project, cmd, output, exit_code)
+        yield _sse({"type": "summary", "text": summary})
         if conversation_id:
             with database.db() as conn:
                 conn.execute(
@@ -703,13 +802,87 @@ async def run_command(project_id: str, body: RunCommandIn):
                     (
                         database.new_id(),
                         conversation_id,
-                        f"Command `{cmd['name']}` finished.\n\n```\n{output[-8000:]}\n```",
+                        f"Command `{cmd['name']}` finished.\n\nSummary: {summary}\n\n```\n{output[-8000:]}\n```",
                         json.dumps({"command_id": cmd["id"]}),
                         database.now_iso(),
                     ),
                 )
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/api/projects/{project_id}/commands/run-once")
+async def run_draft_command(project_id: str, body: RunDraftCommandIn):
+    project = _project(project_id)
+    cmd = {
+        "id": "draft",
+        "name": body.name.strip() or "Suggested command",
+        "description": body.description.strip(),
+        "command": body.command.strip(),
+        "cwd": body.cwd.strip() or str(get_settings().target_app_root),
+    }
+    conversation_id = body.conversation_id
+    if conversation_id:
+        with database.db() as conn:
+            valid = conn.execute(
+                "SELECT id FROM conversations WHERE id = ? AND project_id = ?",
+                (conversation_id, project_id),
+            ).fetchone()
+            if not valid:
+                raise HTTPException(404, "Conversation not found")
+            if body.request_text:
+                conn.execute(
+                    """INSERT INTO messages (id, conversation_id, role, content, extra_json, created_at)
+                       VALUES (?, ?, 'user', ?, NULL, ?)""",
+                    (database.new_id(), conversation_id, body.request_text, database.now_iso()),
+                )
+            conn.execute(
+                """INSERT INTO messages (id, conversation_id, role, content, extra_json, created_at)
+                   VALUES (?, ?, 'system', ?, ?, ?)""",
+                (
+                    database.new_id(),
+                    conversation_id,
+                    f"Running one-time approved command `{cmd['name']}`: `{cmd['command']}`",
+                    json.dumps({"draft": True}),
+                    database.now_iso(),
+                ),
+            )
+
+    async def events():
+        chunks: list[str] = []
+        exit_code = None
+        async for event in command_mod.run_allowlisted(cmd):
+            if event.get("type") == "output":
+                chunks.append(event.get("text") or "")
+            if event.get("type") == "exit":
+                exit_code = event.get("code")
+            yield _sse(event)
+        output = "".join(chunks)
+        summary = await summarize_command_output(project, cmd, output, exit_code)
+        yield _sse({"type": "summary", "text": summary})
+        if conversation_id:
+            with database.db() as conn:
+                conn.execute(
+                    """INSERT INTO messages (id, conversation_id, role, content, extra_json, created_at)
+                       VALUES (?, ?, 'assistant', ?, ?, ?)""",
+                    (
+                        database.new_id(),
+                        conversation_id,
+                        f"One-time command `{cmd['name']}` finished.\n\nSummary: {summary}\n\n```\n{output[-8000:]}\n```",
+                        json.dumps({"draft": True}),
+                        database.now_iso(),
+                    ),
+                )
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.get("/api/projects/{project_id}/logs")

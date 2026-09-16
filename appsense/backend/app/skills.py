@@ -42,12 +42,14 @@ def delete_skill_vectors(skill_id: str) -> None:
     delete_by_metadata(skills_collection(), {"skill_id": skill_id})
 
 
-def list_skills(project_id: str) -> list[dict]:
+def list_skills(project_id: str, executable_only: bool = False) -> list[dict]:
     with database.db() as conn:
+        gate = "AND compiled = 1 AND tested = 1" if executable_only else ""
         rows = conn.execute(
             """SELECT id, project_id, name, goal, body, refined, created_at, updated_at,
+                      compiled, tested, test_output, tested_at,
                       substr(body, 1, 280) AS excerpt
-               FROM skills WHERE project_id = ?
+               FROM skills WHERE project_id = ? """ + gate + """
                ORDER BY updated_at DESC""",
             (project_id,),
         ).fetchall()
@@ -70,6 +72,8 @@ def get_skill(project_id: str, skill_id: str) -> dict | None:
         return None
     d = dict(row)
     d["refined"] = bool(d.get("refined"))
+    d["compiled"] = bool(d.get("compiled"))
+    d["tested"] = bool(d.get("tested"))
     return d
 
 
@@ -89,20 +93,21 @@ def save_skill(
         if not existing:
             raise ValueError("Skill not found")
         with database.db() as conn:
-            conn.execute(
-                """UPDATE skills SET name = ?, goal = ?, body = ?, refined = ?, updated_at = ?
+                conn.execute(
+                     """UPDATE skills SET name = ?, goal = ?, body = ?, refined = ?, updated_at = ?,
+                         compiled = 0, tested = 0, test_output = '', tested_at = NULL
                    WHERE id = ?""",
-                (display, goal.strip(), content, 1 if refined else 0, now, skill_id),
+                     (display, goal.strip(), content, 1 if refined else 0, now, skill_id),
             )
         skill = get_skill(project_id, skill_id)
     else:
         skill_id = database.new_id()
         with database.db() as conn:
             conn.execute(
-                """INSERT INTO skills
-                   (id, project_id, name, goal, body, refined, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (skill_id, project_id, display, goal.strip(), content, 1 if refined else 0, now, now),
+                     """INSERT INTO skills
+                         (id, project_id, name, goal, body, refined, created_at, updated_at, compiled, tested)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+                     (skill_id, project_id, display, goal.strip(), content, 1 if refined else 0, now, now),
             )
         skill = get_skill(project_id, skill_id)
     assert skill
@@ -126,6 +131,29 @@ def reindex_project_skills(project_id: str) -> int:
         if full:
             total += index_skill(full)
     return total
+
+
+def test_skill(project_id: str, skill_id: str) -> dict:
+    skill = get_skill(project_id, skill_id)
+    if not skill:
+        raise ValueError("Skill not found")
+    body = skill.get("body") or ""
+    required = ["## Goal", "## When to use", "## Steps", "## Success criteria", "## If it fails"]
+    missing = [section for section in required if section.lower() not in body.lower()]
+    commands = command_mod.list_commands(project_id)
+    command_names = {c["name"].lower() for c in commands}
+    referenced = re.findall(r"`([A-Za-z0-9_.-]+)`", body)
+    unknown = [name for name in referenced if name.lower() not in command_names and name.lower() in {"restart", "start", "stop", "run"}]
+    failures = missing + ([f"Unknown command: {name}" for name in unknown])
+    compiled = not failures and bool(body.strip())
+    output = "Compiled and tested successfully." if compiled else "Test failed: " + "; ".join(failures or ["Skill body is empty."])
+    now = database.now_iso()
+    with database.db() as conn:
+        conn.execute(
+            "UPDATE skills SET compiled = ?, tested = ?, test_output = ?, tested_at = ? WHERE id = ? AND project_id = ?",
+            (1 if compiled else 0, 1 if compiled else 0, output, now, skill_id, project_id),
+        )
+    return get_skill(project_id, skill_id) | {"test_output": output}
 
 
 def _strip_fence(text: str) -> str:

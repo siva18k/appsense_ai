@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
 import re
+import shutil
+import sys
 from pathlib import Path
 
 import httpx
@@ -71,7 +75,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "propose_command",
-            "description": "Propose an allowlisted operational command for the user to confirm. Never invent a shell command; only use allowlisted names.",
+            "description": "Select a matching allowlisted command, or draft a safe command for the user to review and explicitly add to the allowlist. Never execute a drafted command directly.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -80,6 +84,10 @@ TOOLS = [
                         "description": "Allowlisted command name or id",
                     },
                     "reason": {"type": "string"},
+                    "draft_name": {"type": "string"},
+                    "draft_description": {"type": "string"},
+                    "draft_command": {"type": "string"},
+                    "draft_cwd": {"type": "string"},
                 },
                 "required": ["name_or_id"],
             },
@@ -163,6 +171,33 @@ def expand_skill_slash(skills: list[dict], user_text: str) -> str:
     return user_text
 
 
+def _looks_operational(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(restart|start|stop|run|execute|launch|shutdown|kill|reload|" \
+            r"deploy|rollback|health[- ]check|check)\b",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
+
+
+def _runtime_environment(default_command_cwd: str) -> str:
+    shell = os.getenv("SHELL") or "unknown shell"
+    node = shutil.which("node") or "not available"
+    npm = shutil.which("npm") or "not available"
+    return "\n".join(
+        [
+            f"- OS: {platform.system()} {platform.release()} ({platform.machine()})",
+            f"- Shell: {shell}",
+            f"- Python: {sys.executable} ({platform.python_version()})",
+            f"- Node: {node}",
+            f"- npm: {npm}",
+            f"- Default working directory: {default_command_cwd or 'not configured'}",
+        ]
+    )
+
+
 def retrieve_context(project_id: str, query: str) -> list[dict]:
     kb = query_project(kb_collection(), project_id, query, n_results=8)
     code = query_project(code_collection(), project_id, query, n_results=5)
@@ -204,6 +239,9 @@ def _system_prompt(
     log_paths: list[dict],
     skills: list[dict],
     mode: str,
+    default_command_cwd: str = "",
+    target_app_python: str = "",
+    target_app_env_file: str = "",
 ) -> str:
     cmds = "\n".join(
         f"- {c['name']} (id={c['id']}): {c['description']} | `{c['command']}` cwd={c['cwd']}"
@@ -216,7 +254,8 @@ def _system_prompt(
     if mode == "support":
         mode_block = """You are in **Support mode**.
 Answer using retrieved code learning, knowledge, skills/playbooks, and source snippets.
-For operational actions (restart a service, run a batch job), you MUST call propose_command with an allowlisted name. Never invent shell commands.
+For operational actions (restart a service, run a batch job), you MUST call propose_command. Do not answer with shell instructions, numbered manual steps, or commands in a code block. Prefer a matching allowlisted command. If none matches, draft a command with draft_name, draft_description, draft_command, and draft_cwd for the user to review and add to the allowlist. Never execute a draft without explicit user approval.
+You are already in Support mode. Never tell the user to switch to Support mode, even if an earlier message in the conversation suggested that. Act on the current request through the proposal and confirmation flow.
 If the user invokes a skill with /skill-name, follow that playbook step by step. Still confirm allowlisted commands before execution."""
     else:
         mode_block = """You are in **Chat mode**.
@@ -235,6 +274,16 @@ Configured skills:
 
 Allowlisted commands:
 {cmds}
+
+Default command working directory:
+{default_command_cwd or "(not configured; ask the user before drafting a command)"}
+
+Runtime environment available for command planning:
+{_runtime_environment(default_command_cwd)}
+Target application Python:
+{target_app_python or "not configured"}
+Target application environment file:
+{target_app_env_file or "not configured"}
 
 Configured logs:
 {logs}
@@ -269,6 +318,19 @@ def run_tool(project_id: str, name: str, arguments: dict, mode: str = "chat") ->
             ), None
         cmd = command_mod.match_command(project_id, arguments.get("name_or_id", ""))
         if not cmd:
+            draft_command = (arguments.get("draft_command") or "").strip()
+            draft_cwd = (arguments.get("draft_cwd") or "").strip()
+            if draft_command and draft_cwd:
+                proposal = {
+                    "id": "",
+                    "name": (arguments.get("draft_name") or arguments.get("name_or_id") or "Suggested command").strip(),
+                    "description": (arguments.get("draft_description") or "").strip(),
+                    "command": draft_command,
+                    "cwd": draft_cwd,
+                    "reason": "This command is dynamically generated and not from allow list.",
+                    "draft": True,
+                }
+                return json.dumps({"ok": True, "draft": proposal}), proposal
             available = [c["name"] for c in command_mod.list_commands(project_id)]
             return json.dumps(
                 {
@@ -296,7 +358,11 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
         return
     support = (mode or "chat").lower() == "support"
     allowlist = command_mod.list_commands(project["id"])
-    skills = list_skills(project["id"])
+    default_command_cwd = str(settings.default_command_cwd)
+    target_app_root = str(settings.target_app_root)
+    action_enabled = support
+    operational_request = action_enabled and _looks_operational(user_text)
+    skills = list_skills(project["id"], executable_only=True)
     llm_text = expand_skill_slash(skills, user_text) if support else user_text
     citations = retrieve_context(project["id"], llm_text)
     with database.db() as conn:
@@ -322,7 +388,7 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
     ) or "(no retrieved snippets yet)"
 
     messages = [
-        {"role": "system", "content": _system_prompt(project, allowlist, logs, skills, "support" if support else "chat")},
+        {"role": "system", "content": _system_prompt(project, allowlist, logs, skills, "support" if action_enabled else "chat", target_app_root, settings.target_app_python, str(settings.target_app_env_file or ""))},
         *[
             {
                 "role": m["role"],
@@ -354,10 +420,13 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
             payload = {
                 "model": settings.llm_model,
                 "messages": messages,
-                "tools": TOOLS if support else TOOLS_CHAT,
+                "tools": TOOLS if action_enabled else TOOLS_CHAT,
                 "stream": True,
                 "temperature": 0.2,
             }
+            if operational_request:
+                payload["tools"] = [TOOLS[-1]]
+                payload["tool_choice"] = "required"
             tool_calls: dict[int, dict] = {}
             finish_reason = None
             assistant_parts = []
@@ -402,7 +471,7 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
             if tool_calls and finish_reason == "tool_calls":
                 assistant_msg = {
                     "role": "assistant",
-                    "content": "".join(assistant_parts) or None,
+                    "content": "".join(assistant_parts) or "Checking the requested status.",
                     "tool_calls": [
                         {
                             "id": slot["id"] or f"call_{idx}",
@@ -449,3 +518,46 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
             (database.new_id(), conversation_id, final, extra, database.now_iso()),
         )
     yield {"type": "done", "content": final}
+
+
+async def summarize_command_output(project: dict, command: dict, output: str, exit_code: int | None) -> str:
+    settings = get_settings()
+    if not settings.llm_api_key:
+        return "Command finished. Add an LLM API key in Settings to generate a summary."
+    status = "completed successfully" if exit_code == 0 else f"exited with code {exit_code}"
+    excerpt = output[-12000:] if output else "(no output)"
+    prompt = f"""Summarize this supported-application command execution for a non-technical user.
+State whether it {status} and the key result in 1-2 short sentences.
+Do not invent facts. Maximum 280 characters, no markdown heading, no code block.
+
+Command: {command.get('command', '')}
+Working directory: {command.get('cwd', '')}
+Output:
+{excerpt}"""
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            response = await client.post(
+                f"{settings.llm_base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": settings.llm_model,
+                    "messages": [
+                        {"role": "system", "content": "You summarize command results accurately and briefly."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "stream": False,
+                },
+            )
+            if response.status_code >= 400:
+                return f"Command {status}. Summary unavailable (LLM returned HTTP {response.status_code})."
+            data = response.json()
+            summary = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+            if len(summary) > 280:
+                summary = f"{summary[:277].rstrip()}..."
+            return summary or f"Command {status}."
+    except Exception as exc:
+        return f"Command {status}. Summary unavailable: {exc}"[:500]

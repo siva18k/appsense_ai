@@ -10,10 +10,10 @@ export type ShellContext = {
 
 const NAV = [
   { to: "chat", label: "Chat" },
-  { to: "learning", label: "Learning" },
   { to: "skills", label: "Skills" },
   { to: "code", label: "Code Base" },
   { to: "knowledge", label: "Knowledge base" },
+  { to: "learning", label: "Learning" },
   { to: "settings", label: "Settings" },
 ];
 
@@ -58,7 +58,8 @@ export function AppShell() {
           <BrandMark />
           <div>
             <h1>
-              AppSense <span className="brand-ai">ai</span>
+              <span className="brand-app">App</span><span className="brand-sense">Sense</span>{" "}
+              <span className="brand-ai">ai</span>
             </h1>
             <p>Application support</p>
           </div>

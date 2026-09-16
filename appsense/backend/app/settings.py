@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,11 @@ PUBLIC_KEYS = (
     "SQLITE_PATH",
     "UPLOADS_PATH",
     "REPOS_PATH",
+    "DEFAULT_COMMAND_CWD",
+    "DEFAULT_COMMAND_PYTHON",
+    "TARGET_APP_ROOT",
+    "TARGET_APP_PYTHON",
+    "TARGET_APP_ENV_FILE",
 )
 
 
@@ -34,6 +40,13 @@ def _abs_from_root(value: str, default: str) -> Path:
     return path.resolve()
 
 
+def _abs_from_base(value: str, base: Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
 @dataclass
 class AppSettings:
     llm_base_url: str
@@ -44,6 +57,11 @@ class AppSettings:
     sqlite_path: Path
     uploads_path: Path
     repos_path: Path
+    default_command_cwd: Path
+    default_command_python: str
+    target_app_root: Path
+    target_app_python: str
+    target_app_env_file: Path | None
     has_api_key: bool
 
 
@@ -53,6 +71,14 @@ def get_settings() -> AppSettings:
     sqlite = _abs_from_root(os.getenv("SQLITE_PATH", ""), "./data/appsense.db")
     uploads = _abs_from_root(os.getenv("UPLOADS_PATH", ""), "./data/uploads")
     repos = _abs_from_root(os.getenv("REPOS_PATH", ""), "./data/repos")
+    default_command_cwd = _abs_from_root(os.getenv("DEFAULT_COMMAND_CWD", ""), ".")
+    target_app_root = _abs_from_root(os.getenv("TARGET_APP_ROOT", ""), str(default_command_cwd))
+    target_python_raw = os.getenv("TARGET_APP_PYTHON", "").strip()
+    target_app_python = str(_abs_from_base(target_python_raw, target_app_root)) if target_python_raw else os.getenv(
+        "DEFAULT_COMMAND_PYTHON", sys.executable
+    )
+    target_env_raw = os.getenv("TARGET_APP_ENV_FILE", "").strip()
+    target_app_env_file = _abs_from_base(target_env_raw, target_app_root) if target_env_raw else None
     for p in (chroma, uploads, repos, sqlite.parent):
         p.mkdir(parents=True, exist_ok=True)
     key = os.getenv("LLM_API_KEY", "")
@@ -65,6 +91,11 @@ def get_settings() -> AppSettings:
         sqlite_path=sqlite,
         uploads_path=uploads,
         repos_path=repos,
+        default_command_cwd=default_command_cwd,
+        default_command_python=os.getenv("DEFAULT_COMMAND_PYTHON", sys.executable),
+        target_app_root=target_app_root,
+        target_app_python=target_app_python,
+        target_app_env_file=target_app_env_file,
         has_api_key=bool(key.strip()),
     )
 
@@ -79,6 +110,11 @@ def public_settings_dict() -> dict:
         "sqlite_path": str(s.sqlite_path),
         "uploads_path": str(s.uploads_path),
         "repos_path": str(s.repos_path),
+        "default_command_cwd": str(s.default_command_cwd),
+        "default_command_python": s.default_command_python,
+        "target_app_root": str(s.target_app_root),
+        "target_app_python": s.target_app_python,
+        "target_app_env_file": str(s.target_app_env_file) if s.target_app_env_file else "",
         "has_api_key": s.has_api_key,
         "env_path": str(ENV_PATH),
     }

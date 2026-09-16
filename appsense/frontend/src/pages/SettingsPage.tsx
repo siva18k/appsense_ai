@@ -14,8 +14,15 @@ export function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [embed, setEmbed] = useState("");
   const [chroma, setChroma] = useState("");
+  const [defaultCommandCwd, setDefaultCommandCwd] = useState("");
+  const [defaultCommandPython, setDefaultCommandPython] = useState("");
+  const [targetAppRoot, setTargetAppRoot] = useState("");
+  const [targetAppPython, setTargetAppPython] = useState("");
+  const [targetAppEnvFile, setTargetAppEnvFile] = useState("");
   const [saved, setSaved] = useState("");
   const [commands, setCommands] = useState<AllowCommand[]>([]);
+  const [commandEditorOpen, setCommandEditorOpen] = useState(false);
+  const [editingCommandId, setEditingCommandId] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogPath[]>([]);
   const [cmd, setCmd] = useState({ name: "", description: "", cwd: "", command: "" });
   const [log, setLog] = useState({ label: "", path: "" });
@@ -30,6 +37,11 @@ export function SettingsPage() {
     setLlmModel(s.llm_model);
     setEmbed(s.embedding_model);
     setChroma(s.chroma_path);
+    setDefaultCommandCwd(s.default_command_cwd);
+    setDefaultCommandPython(s.default_command_python);
+    setTargetAppRoot(s.target_app_root);
+    setTargetAppPython(s.target_app_python);
+    setTargetAppEnvFile(s.target_app_env_file);
     if (projectId) {
       setCommands(await api<AllowCommand[]>(`/api/projects/${projectId}/commands`));
       setLogs(await api<LogPath[]>(`/api/projects/${projectId}/logs`));
@@ -50,6 +62,11 @@ export function SettingsPage() {
         llm_api_key: apiKey,
         embedding_model: embed,
         chroma_path: chroma,
+        default_command_cwd: defaultCommandCwd,
+        default_command_python: defaultCommandPython,
+        target_app_root: targetAppRoot,
+        target_app_python: targetAppPython,
+        target_app_env_file: targetAppEnvFile,
       }),
     });
     setApiKey("");
@@ -60,12 +77,24 @@ export function SettingsPage() {
   async function addCommand(e: FormEvent) {
     e.preventDefault();
     if (!projectId) return;
-    await api(`/api/projects/${projectId}/commands`, {
-      method: "POST",
+    await api(`/api/projects/${projectId}/commands${editingCommandId ? `/${editingCommandId}` : ""}`, {
+      method: editingCommandId ? "PATCH" : "POST",
       body: JSON.stringify(cmd),
     });
     setCmd({ name: "", description: "", cwd: "", command: "" });
+    setEditingCommandId(null);
+    setCommandEditorOpen(false);
     await load();
+  }
+
+  function openCommandEditor(command?: AllowCommand) {
+    setEditingCommandId(command?.id || null);
+    setCmd(
+      command
+        ? { name: command.name, description: command.description, cwd: command.cwd, command: command.command }
+        : { name: "", description: "", cwd: "", command: "" }
+    );
+    setCommandEditorOpen(true);
   }
 
   async function addLog(e: FormEvent) {
@@ -106,6 +135,41 @@ export function SettingsPage() {
           <input value={embed} onChange={(e) => setEmbed(e.target.value)} />
           <label>Chroma path</label>
           <input value={chroma} onChange={(e) => setChroma(e.target.value)} />
+          <label>Default command working directory</label>
+          <input
+            value={defaultCommandCwd}
+            onChange={(e) => setDefaultCommandCwd(e.target.value)}
+            placeholder="AppSense project root"
+          />
+          <p className="muted">Commands use this directory unless they define their own override.</p>
+          <label>Default Python executable for commands</label>
+          <input
+            value={defaultCommandPython}
+            onChange={(e) => setDefaultCommandPython(e.target.value)}
+            placeholder="Uses the AppSense virtual environment"
+          />
+          <p className="muted">Commands beginning with python or python3 use this interpreter automatically.</p>
+          <h3 style={{ marginTop: 12 }}>Supported application environment</h3>
+          <p className="muted">These settings describe the separate application AppSense supports, not AppSense itself.</p>
+          <label>Application root</label>
+          <input
+            value={targetAppRoot}
+            onChange={(e) => setTargetAppRoot(e.target.value)}
+            placeholder="/path/to/DataPro AI"
+          />
+          <label>Application Python executable</label>
+          <input
+            value={targetAppPython}
+            onChange={(e) => setTargetAppPython(e.target.value)}
+            placeholder="/path/to/DataPro AI/.venv/bin/python"
+          />
+          <label>Application environment file (optional)</label>
+          <input
+            value={targetAppEnvFile}
+            onChange={(e) => setTargetAppEnvFile(e.target.value)}
+            placeholder="/path/to/DataPro AI/.env"
+          />
+          <p className="muted">The file's variables are passed to supported-app commands without displaying secrets in chat.</p>
           <div className="row">
             <button className="primary">Save</button>
             {saved && <span className="muted">{saved}</span>}
@@ -154,40 +218,17 @@ export function SettingsPage() {
           ))}
         </form>
 
-        <form className="card stack" onSubmit={addCommand}>
+        <div className="card stack">
           <h3 style={{ marginTop: 0 }}>Allowlisted commands</h3>
           <p className="muted">
             Chat can propose these only. They run after you press Confirm — never as free-form
             shell.
           </p>
-          <label>Name</label>
-          <input
-            value={cmd.name}
-            onChange={(e) => setCmd({ ...cmd, name: e.target.value })}
-            placeholder="restart-api"
-            required
-          />
-          <label>Description</label>
-          <input
-            value={cmd.description}
-            onChange={(e) => setCmd({ ...cmd, description: e.target.value })}
-          />
-          <label>Working directory</label>
-          <input
-            value={cmd.cwd}
-            onChange={(e) => setCmd({ ...cmd, cwd: e.target.value })}
-            required
-          />
-          <label>Command</label>
-          <input
-            value={cmd.command}
-            onChange={(e) => setCmd({ ...cmd, command: e.target.value })}
-            placeholder="echo hello"
-            required
-          />
-          <button className="primary">Add command</button>
+          <button type="button" className="primary command-add-button" onClick={() => openCommandEditor()}>
+            Add command
+          </button>
           {commands.map((c) => (
-            <div className="item" key={c.id}>
+            <div className="command-row" key={c.id}>
               <div>
                 <strong>{c.name}</strong>
                 <div className="muted">{c.description}</div>
@@ -195,19 +236,16 @@ export function SettingsPage() {
                   {c.cwd} · {c.command}
                 </div>
               </div>
-              <button
-                type="button"
-                className="danger"
-                onClick={async () => {
+              <div className="command-row-actions">
+                <button type="button" className="subtle" onClick={() => openCommandEditor(c)}>Edit</button>
+                <button type="button" className="danger" onClick={async () => {
                   await api(`/api/projects/${projectId}/commands/${c.id}`, { method: "DELETE" });
                   await load();
-                }}
-              >
-                Remove
-              </button>
+                }}>Remove</button>
+              </div>
             </div>
           ))}
-        </form>
+        </div>
 
         <div className="card stack danger-zone">
           <h3 style={{ marginTop: 0 }}>Delete this project</h3>
@@ -252,6 +290,25 @@ export function SettingsPage() {
           </button>
         </div>
       </div>
+      {commandEditorOpen && (
+        <div className="modal-backdrop">
+          <form className="modal stack" onSubmit={addCommand}>
+            <h3>{editingCommandId ? "Edit command" : "Add command"}</h3>
+            <label>Name</label>
+            <input value={cmd.name} onChange={(e) => setCmd({ ...cmd, name: e.target.value })} placeholder="restart-api" required autoFocus />
+            <label>Description</label>
+            <input value={cmd.description} onChange={(e) => setCmd({ ...cmd, description: e.target.value })} />
+            <label>Working directory (optional override)</label>
+            <input value={cmd.cwd} onChange={(e) => setCmd({ ...cmd, cwd: e.target.value })} placeholder={defaultCommandCwd || "Uses the target app directory"} />
+            <label>Command</label>
+            <input value={cmd.command} onChange={(e) => setCmd({ ...cmd, command: e.target.value })} placeholder="echo hello" required />
+            <div className="row" style={{ justifyContent: "flex-end", marginTop: 8 }}>
+              <button type="button" className="subtle" onClick={() => setCommandEditorOpen(false)}>Cancel</button>
+              <button className="primary">{editingCommandId ? "Save changes" : "Add command"}</button>
+            </div>
+          </form>
+        </div>
+      )}
     </>
   );
 }
