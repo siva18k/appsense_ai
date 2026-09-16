@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://payments:payments@db:5432/payments_prod
+      REDIS_URL: redis://cache:6379/0
+      SETTLEMENT_WINDOW: yesterday
+  db:
+    image: postgres:16
+  cache:
+    image: redis:7

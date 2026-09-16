@@ -1,0 +1,7 @@
+2026-09-15T01:15:01Z INFO  settlement-worker starting window=2026-09-14 processor=northstar
+2026-09-15T01:16:12Z INFO  settlement-worker posted items=1839
+2026-09-15T01:16:13Z WARN  settlement-worker failed item_id=stl_7712 code=processor_timeout
+2026-09-15T01:16:14Z WARN  settlement-worker failed item_id=stl_7718 code=processor_timeout
+2026-09-15T01:16:15Z ERROR settlement-worker failed item_id=stl_7801 code=duplicate_capture
+2026-09-15T01:16:40Z INFO  settlement-worker retry queue=2 skipped=1
+2026-09-15T01:17:02Z INFO  settlement-worker complete status=posted_with_failures failed=3

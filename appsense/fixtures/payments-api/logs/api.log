@@ -1,0 +1,7 @@
+2026-09-15T04:11:02Z INFO  payments.api request_id=req_91a health=ok
+2026-09-15T04:11:18Z INFO  payments.api POST /v1/authorizations merchant=merch_4421 amount=1299 status=approved
+2026-09-15T04:12:03Z WARN  payments.api POST /v1/authorizations merchant=merch_0091 amount=251000 status=402 amount_exceeds_merchant_limit
+2026-09-15T04:13:44Z ERROR payments.api redis timeout after 2000ms pool=payments-cache
+2026-09-15T04:13:45Z ERROR payments.api GET /health degraded=cache
+2026-09-15T04:14:10Z INFO  payments.api redis recovered
+2026-09-15T04:18:22Z ERROR payments.capture auth_id=auth_expired status=409 authorization_expired

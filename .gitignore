@@ -1,0 +1,11 @@
+.env
+.env.local
+appsense/.env
+appsense/data/
+appsense/frontend/node_modules/
+appsense/frontend/dist/
+appsense/backend/.venv/
+appsense/backend/__pycache__/
+appsense/backend/**/__pycache__/
+*.pyc
+.DS_Store
