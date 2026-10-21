@@ -11,3 +11,7 @@ cd backend
 .venv/bin/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 cd frontend; npm run dev
+
+## Presentation
+
+The About presentation is available as [appsense-presentation.pdf](frontend/public/about/appsense-presentation.pdf).
