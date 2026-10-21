@@ -47,7 +47,7 @@ def list_skills(project_id: str, executable_only: bool = False) -> list[dict]:
         gate = "AND compiled = 1 AND tested = 1" if executable_only else ""
         rows = conn.execute(
             """SELECT id, project_id, name, goal, body, refined, created_at, updated_at,
-                      compiled, tested, test_output, tested_at,
+                      compiled, tested, test_output, tested_at, test_status, test_started_at,
                       substr(body, 1, 280) AS excerpt
                FROM skills WHERE project_id = ? """ + gate + """
                ORDER BY updated_at DESC""",
@@ -95,7 +95,7 @@ def save_skill(
         with database.db() as conn:
                 conn.execute(
                      """UPDATE skills SET name = ?, goal = ?, body = ?, refined = ?, updated_at = ?,
-                         compiled = 0, tested = 0, test_output = '', tested_at = NULL
+                         compiled = 0, tested = 0, test_output = '', tested_at = NULL, test_status = 'idle', test_started_at = NULL
                    WHERE id = ?""",
                      (display, goal.strip(), content, 1 if refined else 0, now, skill_id),
             )
@@ -150,8 +150,8 @@ def test_skill(project_id: str, skill_id: str) -> dict:
     now = database.now_iso()
     with database.db() as conn:
         conn.execute(
-            "UPDATE skills SET compiled = ?, tested = ?, test_output = ?, tested_at = ? WHERE id = ? AND project_id = ?",
-            (1 if compiled else 0, 1 if compiled else 0, output, now, skill_id, project_id),
+            "UPDATE skills SET compiled = ?, tested = ?, test_output = ?, tested_at = ?, test_status = ?, test_started_at = NULL WHERE id = ? AND project_id = ?",
+            (1 if compiled else 0, 1 if compiled else 0, output, now, "completed" if compiled else "failed", skill_id, project_id),
         )
     return get_skill(project_id, skill_id) | {"test_output": output}
 

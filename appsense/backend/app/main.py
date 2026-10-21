@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ from .ingest_kb import (
     replace_upload_doc,
     update_text_doc,
 )
-from .scan_code import scan_repository
+from .scan_code import ScanCancelled, scan_repository
 from .skills import (
     delete_skill,
     delete_skill_vectors,
@@ -41,7 +41,12 @@ from .settings import get_settings, public_settings_dict, update_env
 app = FastAPI(title="AppSense")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1",
+        "http://localhost",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -273,6 +278,14 @@ def create_conversation(project_id: str):
             (cid, project_id, "New chat", created),
         )
     return {"id": cid, "project_id": project_id, "title": "New chat", "created_at": created}
+
+
+@app.delete("/api/projects/{project_id}/conversations")
+def clear_conversations(project_id: str):
+    _project(project_id)
+    with database.db() as conn:
+        conn.execute("DELETE FROM conversations WHERE project_id = ?", (project_id,))
+    return {"ok": True}
 
 
 @app.get("/api/projects/{project_id}/conversations/{conversation_id}")
@@ -588,12 +601,29 @@ def patch_skill(project_id: str, skill_id: str, body: SkillIn):
 
 
 @app.post("/api/projects/{project_id}/skills/{skill_id}/test")
-def test_skill_endpoint(project_id: str, skill_id: str):
+def test_skill_endpoint(project_id: str, skill_id: str, background_tasks: BackgroundTasks):
     _project(project_id)
+    skill = get_skill(project_id, skill_id)
+    if not skill:
+        raise HTTPException(404, "Skill not found")
+    with database.db() as conn:
+        conn.execute(
+            "UPDATE skills SET test_status = 'running', test_started_at = ?, test_output = '' WHERE id = ? AND project_id = ?",
+            (database.now_iso(), skill_id, project_id),
+        )
+    background_tasks.add_task(_run_skill_test, project_id, skill_id)
+    return get_skill(project_id, skill_id)
+
+
+def _run_skill_test(project_id: str, skill_id: str) -> None:
     try:
-        return test_skill(project_id, skill_id)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from exc
+        test_skill(project_id, skill_id)
+    except Exception as exc:
+        with database.db() as conn:
+            conn.execute(
+                "UPDATE skills SET compiled = 0, tested = 0, test_status = 'failed', test_output = ?, tested_at = ? WHERE id = ? AND project_id = ?",
+                (f"Test failed: {exc}", database.now_iso(), skill_id, project_id),
+            )
 
 
 @app.delete("/api/projects/{project_id}/skills/{skill_id}")
@@ -611,7 +641,17 @@ def list_repos(project_id: str):
             "SELECT * FROM repos WHERE project_id = ? ORDER BY created_at DESC",
             (project_id,),
         ).fetchall()
-    return database.rows_to_list(rows)
+        repos = database.rows_to_list(rows)
+        for repo in repos:
+            summary = ""
+            if repo.get("scan_doc_id"):
+                doc = conn.execute(
+                    "SELECT summary FROM kb_docs WHERE id = ? AND project_id = ?",
+                    (repo["scan_doc_id"], project_id),
+                ).fetchone()
+                summary = (doc["summary"] if doc else "") or ""
+            repo["summary"] = summary or f"{repo['kind'].capitalize()} repository at {repo['source']}"
+    return repos
 
 
 @app.post("/api/projects/{project_id}/repos/local")
@@ -632,8 +672,46 @@ def repo_remote(project_id: str, body: RepoRemoteIn):
         raise HTTPException(400, str(exc)) from exc
 
 
-@app.post("/api/projects/{project_id}/repos/{repo_id}/scan")
-def repo_scan(project_id: str, repo_id: str):
+def _run_repo_scan(project_id: str, repo_id: str) -> None:
+    try:
+        with database.db() as conn:
+            row = conn.execute(
+                "SELECT * FROM repos WHERE id = ? AND project_id = ?", (repo_id, project_id)
+            ).fetchone()
+        if not row:
+            return
+        def progress(current: int, total: int, phase: str) -> None:
+            with database.db() as conn:
+                conn.execute(
+                    "UPDATE repos SET scan_progress = ?, scan_total = ?, scan_phase = ? WHERE id = ?",
+                    (current, total, phase, repo_id),
+                )
+            with database.db() as conn:
+                cancelled = conn.execute("SELECT scan_cancel_requested FROM repos WHERE id = ?", (repo_id,)).fetchone()
+            return not bool(cancelled and cancelled[0])
+
+        scan_repository(dict(row), progress=progress)
+        with database.db() as conn:
+            conn.execute(
+                "UPDATE repos SET scan_status = 'completed', scan_error = '', scan_phase = 'complete', scan_progress = scan_total WHERE id = ?",
+                (repo_id,),
+            )
+    except ScanCancelled:
+        with database.db() as conn:
+            conn.execute(
+                "UPDATE repos SET scan_status = 'cancelled', scan_error = '', scan_phase = 'cancelled' WHERE id = ?",
+                (repo_id,),
+            )
+    except Exception as exc:
+        with database.db() as conn:
+            conn.execute(
+                "UPDATE repos SET scan_status = 'failed', scan_error = ?, scan_phase = 'failed' WHERE id = ?",
+                (str(exc), repo_id),
+            )
+
+
+@app.post("/api/projects/{project_id}/repos/{repo_id}/scan", status_code=202)
+def repo_scan(project_id: str, repo_id: str, background_tasks: BackgroundTasks):
     _project(project_id)
     with database.db() as conn:
         row = conn.execute(
@@ -642,12 +720,27 @@ def repo_scan(project_id: str, repo_id: str):
         ).fetchone()
     if not row:
         raise HTTPException(404, "Repo not found")
-    try:
-        return scan_repository(dict(row))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(502, f"Scan failed: {exc}") from exc
+    with database.db() as conn:
+        conn.execute(
+            "UPDATE repos SET scan_status = 'running', scan_error = '', scan_cancel_requested = 0, scan_started_at = ?, scan_progress = 0, scan_total = 0, scan_phase = 'queued' WHERE id = ?",
+            (database.now_iso(), repo_id),
+        )
+    background_tasks.add_task(_run_repo_scan, project_id, repo_id)
+    return {"repo": dict(row), "status": "running"}
+
+
+@app.post("/api/projects/{project_id}/repos/{repo_id}/scan/stop")
+def stop_repo_scan(project_id: str, repo_id: str):
+    _project(project_id)
+    with database.db() as conn:
+        updated = conn.execute(
+            """UPDATE repos SET scan_cancel_requested = 1, scan_status = 'cancelled',
+               scan_phase = 'cancelled' WHERE id = ? AND project_id = ? AND scan_status = 'running'""",
+            (repo_id, project_id),
+        ).rowcount
+    if not updated:
+        raise HTTPException(409, "Scan is not running")
+    return {"status": "cancellation_requested"}
 
 
 @app.post("/api/projects/{project_id}/repos/{repo_id}/reindex")

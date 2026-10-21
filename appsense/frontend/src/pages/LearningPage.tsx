@@ -162,7 +162,7 @@ export function LearningPage() {
             </section>
             <section className="learn-section">
               <h3>Code scans ({scans.length})</h3>
-              {scans.length === 0 && <p className="muted">Scan a repo in Code Base to add a handbook.</p>}
+              {scans.length === 0 && <p className="muted">Scan a repo in Codebase to add a handbook.</p>}
               {scans.map((d) => (
                 <button
                   type="button"

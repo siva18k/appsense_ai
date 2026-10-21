@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from functools import lru_cache
 from typing import Any, Sequence
 
@@ -10,6 +11,7 @@ import httpx
 from .settings import get_settings
 
 LOCAL_EMBED_PREFIXES = ("all-minilm", "all-mpnet", "paraphrase-", "multi-qa-")
+_CHROMA_LOCK = threading.RLock()
 
 
 def kb_collection() -> str:
@@ -160,22 +162,24 @@ def upsert_chunks(
 ) -> None:
     if not ids:
         return
-    col = get_collection(collection_name)
-    batch = 32
-    for i in range(0, len(ids), batch):
-        col.upsert(
-            ids=ids[i : i + batch],
-            documents=documents[i : i + batch],
-            metadatas=metadatas[i : i + batch],
-        )
+    with _CHROMA_LOCK:
+        col = get_collection(collection_name)
+        batch = 32
+        for i in range(0, len(ids), batch):
+            col.upsert(
+                ids=ids[i : i + batch],
+                documents=documents[i : i + batch],
+                metadatas=metadatas[i : i + batch],
+            )
 
 
 def delete_by_metadata(collection_name: str, where: dict[str, Any]) -> None:
-    col = get_collection(collection_name)
-    try:
-        col.delete(where=where)
-    except Exception:
-        pass
+    with _CHROMA_LOCK:
+        col = get_collection(collection_name)
+        try:
+            col.delete(where=where)
+        except Exception:
+            pass
 
 
 def query_project(
@@ -185,19 +189,20 @@ def query_project(
     n_results: int = 6,
     extra_where: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    col = get_collection(collection_name)
-    where: dict[str, Any] = {"project_id": project_id}
-    if extra_where:
-        where = {"$and": [where, extra_where]}
-    try:
-        result = col.query(
-            query_texts=[query],
-            n_results=n_results,
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
-    except Exception:
-        return []
+    with _CHROMA_LOCK:
+        col = get_collection(collection_name)
+        where: dict[str, Any] = {"project_id": project_id}
+        if extra_where:
+            where = {"$and": [where, extra_where]}
+        try:
+            result = col.query(
+                query_texts=[query],
+                n_results=n_results,
+                where=where,
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception:
+            return []
     docs = (result.get("documents") or [[]])[0]
     metas = (result.get("metadatas") or [[]])[0]
     dists = (result.get("distances") or [[]])[0]

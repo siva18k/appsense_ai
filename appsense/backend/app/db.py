@@ -106,6 +106,17 @@ def init_db() -> None:
             conn.execute("ALTER TABLE repos ADD COLUMN last_scanned_at TEXT")
         if "scan_doc_id" not in cols:
             conn.execute("ALTER TABLE repos ADD COLUMN scan_doc_id TEXT")
+        for name, definition in (
+            ("scan_status", "TEXT NOT NULL DEFAULT 'idle'"),
+            ("scan_error", "TEXT NOT NULL DEFAULT ''"),
+            ("scan_started_at", "TEXT"),
+            ("scan_progress", "INTEGER NOT NULL DEFAULT 0"),
+            ("scan_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("scan_phase", "TEXT NOT NULL DEFAULT ''"),
+            ("scan_cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE repos ADD COLUMN {name} {definition}")
         kb_cols = {row[1] for row in conn.execute("PRAGMA table_info(kb_docs)").fetchall()}
         if "updated_at" not in kb_cols:
             conn.execute("ALTER TABLE kb_docs ADD COLUMN updated_at TEXT")
@@ -128,6 +139,8 @@ def init_db() -> None:
               tested INTEGER NOT NULL DEFAULT 0,
               test_output TEXT NOT NULL DEFAULT '',
               tested_at TEXT,
+              test_status TEXT NOT NULL DEFAULT 'idle',
+              test_started_at TEXT,
               FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
             )"""
         )
@@ -137,6 +150,8 @@ def init_db() -> None:
             ("tested", "INTEGER NOT NULL DEFAULT 0"),
             ("test_output", "TEXT NOT NULL DEFAULT ''"),
             ("tested_at", "TEXT"),
+            ("test_status", "TEXT NOT NULL DEFAULT 'idle'"),
+            ("test_started_at", "TEXT"),
         ):
             if name not in skill_cols:
                 conn.execute(f"ALTER TABLE skills ADD COLUMN {name} {definition}")

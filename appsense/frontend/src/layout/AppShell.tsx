@@ -11,8 +11,8 @@ export type ShellContext = {
 const NAV = [
   { to: "chat", label: "Chat" },
   { to: "skills", label: "Skills" },
-  { to: "code", label: "Code Base" },
-  { to: "knowledge", label: "Knowledge base" },
+  { to: "code", label: "Codebase" },
+  { to: "knowledge", label: "Knowledge Base" },
   { to: "learning", label: "Learning" },
   { to: "settings", label: "Settings" },
 ];

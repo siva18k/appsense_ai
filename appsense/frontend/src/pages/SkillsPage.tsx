@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import Markdown from "react-markdown";
-import { useNavigate, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import { api } from "../api";
 
 export type Skill = {
@@ -18,11 +18,12 @@ export type Skill = {
   tested: boolean;
   test_output?: string;
   tested_at?: string | null;
+  test_status?: "idle" | "running" | "completed" | "failed";
+  test_started_at?: string | null;
 };
 
 export function SkillsPage() {
   const { projectId } = useParams();
-  const navigate = useNavigate();
   const [skills, setSkills] = useState<Skill[]>([]);
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("");
@@ -34,6 +35,7 @@ export function SkillsPage() {
   const [editing, setEditing] = useState<Skill | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
 
   async function load() {
     if (!projectId) return;
@@ -44,6 +46,8 @@ export function SkillsPage() {
     load().catch(console.error);
     setEditing(null);
     setExpanded(null);
+    const timer = window.setInterval(() => load().catch(console.error), 3000);
+    return () => window.clearInterval(timer);
   }, [projectId]);
 
   async function refine(e?: FormEvent) {
@@ -84,6 +88,7 @@ export function SkillsPage() {
       setGoal("");
       setDraft("");
       setRefined(false);
+      setAddOpen(false);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Save failed");
@@ -139,7 +144,7 @@ export function SkillsPage() {
         method: "POST",
       });
       setSkills((current) => current.map((item) => (item.id === result.id ? result : item)));
-      setTestMessage(result.test_output || "Skill test completed.");
+      setTestMessage("Skill test started in the background.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Skill test failed");
     } finally {
@@ -151,90 +156,12 @@ export function SkillsPage() {
     <>
       <div className="topbar">
         <h2>Skills</h2>
+        <button className="primary" onClick={() => setAddOpen(true)}>Add skill</button>
       </div>
       <div className="page page-wide">
-        <p className="lede">
-          Describe a multi-step agent task (report, batch job, email, restart, and so on). Save it as
-          written, or optionally Refine with AI so it becomes a detailed markdown playbook using this
-          app’s knowledge, code, and allowlisted commands.
-        </p>
+        <p className="lede">Create multi-step AI playbooks using your app’s knowledge, code, and approved commands.</p>
         {error && <p className="muted">{error}</p>}
         {testMessage && <p className="skill-test-result">{testMessage}</p>}
-
-        <div className="card kb-composer">
-          <form
-            className="stack"
-            onSubmit={(e) => {
-              e.preventDefault();
-              save(false);
-            }}
-          >
-            <label>Skill name</label>
-            <input
-              className="title-input"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Nightly settlement check"
-            />
-            <label>What should this skill do?</label>
-            <textarea
-              value={goal}
-              onChange={(e) => {
-                setGoal(e.target.value);
-                if (!refined) setDraft("");
-              }}
-              placeholder="e.g. Check yesterday’s batch, summarize failures from the log, and propose the allowlisted restart if it died."
-              required
-            />
-            {draft && (
-              <>
-                <label>Refined playbook (editable before save)</label>
-                <textarea
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  style={{ minHeight: 260 }}
-                />
-                <p className="muted">
-                  You can still save the original wording instead of this refined markdown.
-                </p>
-              </>
-            )}
-            <div className="row" style={{ flexWrap: "wrap" }}>
-              <button type="button" className="subtle" disabled={busy || !goal.trim()} onClick={refine}>
-                {busy ? "Working…" : "Refine with AI"}
-              </button>
-              {draft ? (
-                <>
-                  <button
-                    type="button"
-                    className="primary"
-                    disabled={busy}
-                    onClick={() => save(true)}
-                  >
-                    Save refined skill
-                  </button>
-                  <button type="button" className="subtle" disabled={busy} onClick={() => save(false)}>
-                    Save original only
-                  </button>
-                  <button
-                    type="button"
-                    className="subtle"
-                    onClick={() => {
-                      setDraft("");
-                      setRefined(false);
-                    }}
-                  >
-                    Discard refine
-                  </button>
-                </>
-              ) : (
-                <button className="primary" disabled={busy || !goal.trim()}>
-                  Save without AI
-                </button>
-              )}
-            </div>
-          </form>
-        </div>
 
         <div className="kb-list">
           {skills.length === 0 && (
@@ -255,7 +182,7 @@ export function SkillsPage() {
                     <div className="muted">
                       {s.refined ? "AI-refined playbook" : "Saved as written"}
                       {" · "}
-                      {s.tested ? "Test passed" : "Not tested"}
+                      {s.test_status === "running" ? "Testing…" : s.tested ? "Test passed" : s.test_status === "failed" ? "Test failed" : "Not tested"}
                       {" · "}
                       Updated {new Date(s.updated_at).toLocaleString()}
                     </div>
@@ -265,27 +192,15 @@ export function SkillsPage() {
                     <button
                       className="subtle"
                       onClick={async () => {
-                        if (open) {
-                          setExpanded(null);
-                          setEditing(null);
-                          return;
-                        }
                         const full = await api<Skill>(`/api/projects/${projectId}/skills/${s.id}`);
                         setEditing(full);
                         setExpanded(s.id);
                       }}
                     >
-                      {open ? "Collapse" : "Expand"}
+                      Edit
                     </button>
-                    <button
-                      className="primary"
-                      disabled={!s.tested || busy}
-                      onClick={() => navigate(`/projects/${projectId}/chat?skill=${s.id}`)}
-                    >
-                      Use in chat
-                    </button>
-                    <button className="subtle" disabled={busy} onClick={() => testExisting(s)}>
-                      {testingId === s.id ? "Testing…" : "Test skill"}
+                    <button className="subtle" disabled={busy || s.test_status === "running"} onClick={() => testExisting(s)}>
+                      {testingId === s.id || s.test_status === "running" ? "Testing…" : "Test skill"}
                     </button>
                     <button
                       className="danger"
@@ -299,6 +214,24 @@ export function SkillsPage() {
                     </button>
                   </div>
                 </div>
+                <button
+                  type="button"
+                  className="card-expand-button"
+                  onClick={async () => {
+                        if (open) {
+                          setExpanded(null);
+                          setEditing(null);
+                          return;
+                        }
+                        const full = await api<Skill>(`/api/projects/${projectId}/skills/${s.id}`);
+                        setEditing(full);
+                        setExpanded(s.id);
+                      }}
+                  aria-label={open ? "Collapse details" : "Expand details"}
+                  title={open ? "Collapse details" : "Expand details"}
+                    >
+                  <span className={`card-expand-chevron ${open ? "open" : ""}`} aria-hidden />
+                </button>
                 {open && current && (
                   <div className="kb-card-preview">
                     <div className="stack">
@@ -345,6 +278,32 @@ export function SkillsPage() {
           })}
         </div>
       </div>
+      {addOpen && (
+        <div className="modal-backdrop" onClick={() => !busy && setAddOpen(false)}>
+          <div className="modal knowledge-modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Add skill</h3>
+            <form className="stack" onSubmit={(e) => { e.preventDefault(); save(false); }}>
+              <label>Skill name</label>
+              <input className="title-input" value={name} onChange={(e) => setName(e.target.value)} placeholder="Check and restart MCP server" required autoFocus />
+              <label>What should this skill do?</label>
+              <textarea className="knowledge-body-input" value={goal} onChange={(e) => { setGoal(e.target.value); if (!refined) setDraft(""); }} placeholder="Describe the multi-step task in plain language…" required />
+              {draft && <>
+                <label>Refined playbook</label>
+                <textarea value={draft} onChange={(e) => setDraft(e.target.value)} style={{ minHeight: 280 }} />
+                <p className="muted">Review the playbook, then save it before testing.</p>
+              </>}
+              <div className="row" style={{ flexWrap: "wrap" }}>
+                <button type="button" className="subtle" disabled={busy || !goal.trim()} onClick={refine}>{busy ? "Working…" : "Refine with AI"}</button>
+                {draft ? <>
+                  <button type="button" className="primary" disabled={busy} onClick={() => save(true)}>Save refined skill</button>
+                  <button type="button" className="subtle" disabled={busy} onClick={() => save(false)}>Save original only</button>
+                </> : <button className="primary" disabled={busy || !goal.trim()}>Save without AI</button>}
+                <button type="button" className="subtle" disabled={busy} onClick={() => setAddOpen(false)}>Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </>
   );
 }

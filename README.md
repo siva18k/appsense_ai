@@ -84,7 +84,7 @@ AppSense may propose the next step. It does not run free-form shell. Allowlisted
 - **Settings** — LLM, embeddings, log paths, allowlisted commands, delete project  
 - **About** — full presentation in a new tab  
 
-A Payments API fixture is included for local testing (`appsense/fixtures/payments-api`).
+Link your own application under **Code Base**, scan it, then use Chat or Support. See [`appsense/README.md`](appsense/README.md) for full setup.
 
 ---
 
@@ -115,14 +115,6 @@ npm run dev
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Vite proxies `/api` to the backend.
 
-Optional demo data for the Payments API project:
-
-```bash
-cd appsense/backend
-source .venv/bin/activate
-python -m app.seed_demo
-```
-
 ---
 
 ## Configuration
@@ -142,3 +134,32 @@ Copy [`appsense/.env.sample`](appsense/.env.sample) to `appsense/.env`. **Do not
 ## License
 
 Use and extend for your own application support. Keep secrets in `.env`, never in git.
+
+---
+
+## Start the app
+
+Run these from the repository root. There is no `package.json` here, so `npm run dev` in this folder will fail.
+
+**Backend** (`appsense/backend`):
+
+```bash
+cd appsense/backend
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+**Frontend** (`appsense/frontend`), in a second terminal:
+
+```bash
+cd appsense/frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+- App: [http://127.0.0.1:5173](http://127.0.0.1:5173)
+- API: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+
+Vite proxies `/api` to the backend. Copy `appsense/.env.sample` to `appsense/.env` and set `LLM_API_KEY` before using Chat.

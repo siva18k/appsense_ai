@@ -113,7 +113,7 @@ export function SettingsPage() {
       <div className="topbar">
         <h2>Settings</h2>
       </div>
-      <div className="page page-wide">
+      <div className="page page-wide settings-page">
         <p className="lede">
           API keys are stored in <code>{settings?.env_path}</code> and are never shown after save.
         </p>

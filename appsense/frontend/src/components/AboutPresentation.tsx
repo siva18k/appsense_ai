@@ -115,7 +115,7 @@ function Visual({ kind }: { kind: (typeof SLIDES)[number]["visual"] }) {
         <figure className="deck-figure compact">
           <img src="/about/appsense-loop.png" alt="Learning loop around a knowledge core" />
         </figure>
-        <Flow items={["Code Base", "Scan", "Knowledge", "Skills", "Chat"]} />
+        <Flow items={["Codebase", "Scan", "Knowledge Base", "Skills", "Chat"]} />
         <div className="deck-mini-grid">
           <span>Scan writes the handbook</span>
           <span>Notes stay searchable</span>

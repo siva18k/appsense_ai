@@ -20,6 +20,10 @@ export function CodeBasePage() {
 
   useEffect(() => {
     load().catch(console.error);
+    const timer = window.setInterval(() => {
+      load().catch(console.error);
+    }, 3000);
+    return () => window.clearInterval(timer);
   }, [projectId]);
 
   async function addRepo(e: FormEvent) {
@@ -64,25 +68,34 @@ export function CodeBasePage() {
     }
   }
 
+  async function stopScan(repo: Repo) {
+    if (!projectId) return;
+    setError("");
+    try {
+      await api(`/api/projects/${projectId}/repos/${repo.id}/scan/stop`, { method: "POST" });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not stop scan");
+    }
+  }
+
   return (
     <>
       <div className="topbar">
-        <h2>Code Base</h2>
+        <h2>Codebase</h2>
         <button className="primary" onClick={() => setOpen(true)}>
           Add repo
         </button>
       </div>
       <div className="page page-wide">
-        <p className="lede">
-          Link a local folder or Git URL, then Scan. Scan reads the source, writes a markdown
-          handbook into Learning, and embeds it for chat RAG alongside the knowledge base.
-        </p>
+        <p className="lede">Add local or git url. The code will be scanned and documented to be used by LLM.</p>
         {error && <p className="muted">{error}</p>}
         <div className="card" style={{ padding: 0, overflow: "auto" }}>
           <table className="data-table">
             <thead>
               <tr>
                 <th>Repo name</th>
+                <th>Preview</th>
                 <th>URL or local path</th>
                 <th>Last scan</th>
                 <th />
@@ -91,7 +104,7 @@ export function CodeBasePage() {
             <tbody>
               {repos.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="muted" style={{ padding: 24, textAlign: "center" }}>
+                  <td colSpan={5} className="muted" style={{ padding: 24, textAlign: "center" }}>
                     No repositories yet. Use Add repo, then Scan.
                   </td>
                 </tr>
@@ -102,21 +115,38 @@ export function CodeBasePage() {
                     <strong>{r.name}</strong>
                     <div className="muted">{r.kind}</div>
                   </td>
+                  <td>
+                    <div className="repo-summary">{r.summary || "No preview available yet."}</div>
+                  </td>
                   <td className="path-cell">{r.source}</td>
                   <td className="muted">
-                    {r.last_scanned_at
-                      ? new Date(r.last_scanned_at).toLocaleString()
-                      : "Not scanned"}
+                    {r.scan_status === "running" ? (
+                      <span className="scan-status-running">
+                        {r.scan_phase || "Scanning…"}
+                        {r.scan_total ? ` (${r.scan_progress || 0}/${r.scan_total})` : ""}
+                      </span>
+                    ) : r.scan_status === "cancelled" ? (
+                      <span>Scan stopped</span>
+                    ) : r.scan_status === "failed" ? (
+                      <span title={r.scan_error}>Scan failed</span>
+                    ) : r.last_scanned_at ? (
+                      <>Scanned {new Date(r.last_scanned_at).toLocaleString()}</>
+                    ) : (
+                      "Not scanned"
+                    )}
                   </td>
                   <td>
                     <div className="row" style={{ justifyContent: "flex-end" }}>
                       <button
                         className="primary"
-                        disabled={scanning !== null}
+                        disabled={scanning !== null || r.scan_status === "running"}
                         onClick={() => scan(r)}
                       >
-                        {scanning === r.id ? "Scanning…" : "Scan"}
+                        {scanning === r.id || r.scan_status === "running" ? "Scanning…" : "Scan"}
                       </button>
+                      {r.scan_status === "running" && (
+                        <button className="subtle" onClick={() => stopScan(r)}>Stop</button>
+                      )}
                       <button
                         className="danger"
                         disabled={scanning !== null}
@@ -160,7 +190,7 @@ export function CodeBasePage() {
                 </button>
               </div>
               <label>Repo name</label>
-              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="payments-api" />
+              <input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-application" />
               <label>{kind === "local" ? "Local path" : "Repository URL"}</label>
               <input
                 value={location}

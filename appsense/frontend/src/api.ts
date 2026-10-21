@@ -40,8 +40,16 @@ export type Repo = {
   kind: string;
   source: string;
   local_path: string;
+  summary?: string;
   last_indexed_at?: string | null;
   last_scanned_at?: string | null;
+  scan_status?: "idle" | "running" | "completed" | "failed" | "cancelled";
+  scan_error?: string;
+  scan_started_at?: string | null;
+  scan_progress?: number;
+  scan_total?: number;
+  scan_phase?: string;
+  scan_cancel_requested?: boolean | number;
   scan_doc_id?: string | null;
 };
 

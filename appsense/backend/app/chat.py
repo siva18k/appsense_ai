@@ -199,38 +199,28 @@ def _runtime_environment(default_command_cwd: str) -> str:
 
 
 def retrieve_context(project_id: str, query: str) -> list[dict]:
-    kb = query_project(kb_collection(), project_id, query, n_results=8)
-    code = query_project(code_collection(), project_id, query, n_results=5)
-    skills = query_project(skills_collection(), project_id, query, n_results=4)
-    citations = []
-    for h in kb:
-        meta = h.get("metadata") or {}
-        citations.append(
-            {
-                "kind": "knowledge",
-                "title": meta.get("title"),
-                "text": (h.get("text") or "")[:400],
-            }
-        )
-    for h in skills:
-        meta = h.get("metadata") or {}
-        citations.append(
-            {
-                "kind": "skill",
-                "title": meta.get("title"),
-                "text": (h.get("text") or "")[:500],
-            }
-        )
-    for h in code:
-        meta = h.get("metadata") or {}
-        citations.append(
-            {
-                "kind": "code",
-                "title": meta.get("path"),
-                "text": (h.get("text") or "")[:400],
-            }
-        )
-    return citations
+    terms = {term.lower() for term in re.findall(r"[a-zA-Z0-9_/-]{3,}", query)}
+    with database.db() as conn:
+        rows = conn.execute(
+            "SELECT title, source_type, body FROM kb_docs WHERE project_id = ? ORDER BY updated_at DESC",
+            (project_id,),
+        ).fetchall()
+    ranked = []
+    for row in rows:
+        body = row["body"] or ""
+        haystack = f"{row['title']} {body}".lower()
+        score = sum(haystack.count(term) for term in terms)
+        if score:
+            ranked.append((score, row))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "kind": "code" if row["source_type"] == "code_scan" else "knowledge",
+            "title": row["title"],
+            "text": (row["body"] or "")[:1000],
+        }
+        for _, row in ranked[:12]
+    ]
 
 
 def _system_prompt(
@@ -413,7 +403,9 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
         "Content-Type": "application/json",
     }
     assistant_parts: list[str] = []
+    spoken: list[str] = []
     proposal = None
+    status_note_sent = False
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         for _round in range(4):
@@ -428,7 +420,6 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                 payload["tools"] = [TOOLS[-1]]
                 payload["tool_choice"] = "required"
             tool_calls: dict[int, dict] = {}
-            finish_reason = None
             assistant_parts = []
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
@@ -449,10 +440,10 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                     except json.JSONDecodeError:
                         continue
                     choice = (chunk.get("choices") or [{}])[0]
-                    finish_reason = choice.get("finish_reason") or finish_reason
                     delta = choice.get("delta") or {}
                     if delta.get("content"):
                         assistant_parts.append(delta["content"])
+                        spoken.append(delta["content"])
                         yield {"type": "token", "text": delta["content"]}
                     for tc in delta.get("tool_calls") or []:
                         idx = tc.get("index", 0)
@@ -468,10 +459,19 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                         if fn.get("arguments"):
                             slot["arguments"] += fn["arguments"]
 
-            if tool_calls and finish_reason == "tool_calls":
+            named_calls = {
+                idx: slot for idx, slot in tool_calls.items() if (slot.get("name") or "").strip()
+            }
+            if named_calls:
+                if not assistant_parts and not status_note_sent:
+                    status_note_sent = True
+                    note = "Checking that now."
+                    assistant_parts.append(note)
+                    spoken.append(note)
+                    yield {"type": "token", "text": note}
                 assistant_msg = {
                     "role": "assistant",
-                    "content": "".join(assistant_parts) or "Checking the requested status.",
+                    "content": "".join(assistant_parts),
                     "tool_calls": [
                         {
                             "id": slot["id"] or f"call_{idx}",
@@ -481,11 +481,11 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                                 "arguments": slot["arguments"] or "{}",
                             },
                         }
-                        for idx, slot in sorted(tool_calls.items())
+                        for idx, slot in sorted(named_calls.items())
                     ],
                 }
                 messages.append(assistant_msg)
-                for idx, slot in sorted(tool_calls.items()):
+                for idx, slot in sorted(named_calls.items()):
                     try:
                         args = json.loads(slot["arguments"] or "{}")
                     except json.JSONDecodeError:
@@ -498,6 +498,7 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                     result, maybe_proposal = run_tool(project["id"], slot["name"], args, "support" if support else "chat")
                     if maybe_proposal:
                         proposal = maybe_proposal
+                        operational_request = False
                         yield {"type": "command_proposal", "command": maybe_proposal}
                     messages.append(
                         {
@@ -509,7 +510,7 @@ async def stream_chat(project: dict, conversation_id: str, user_text: str, mode:
                 continue
             break
 
-    final = "".join(assistant_parts).strip()
+    final = "".join(spoken).strip()
     extra = json.dumps({"proposal": proposal}) if proposal else None
     with database.db() as conn:
         conn.execute(

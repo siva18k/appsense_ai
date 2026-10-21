@@ -32,6 +32,10 @@ MAX_CHARS_PER_FILE = 5000
 BATCH_CHARS = 14000
 
 
+class ScanCancelled(Exception):
+    pass
+
+
 def _priority(path: Path) -> int:
     name = path.name.lower()
     if name in PRIORITY_NAMES or name.startswith("readme"):
@@ -120,7 +124,7 @@ Files scanned: {len(files)}
 """
 
 
-def scan_repository(repo: dict) -> dict:
+def scan_repository(repo: dict, progress=None) -> dict:
     root = Path(repo["local_path"]).resolve()
     if not root.is_dir():
         raise ValueError(f"Repository path does not exist: {root}")
@@ -133,7 +137,13 @@ def scan_repository(repo: dict) -> dict:
         "entry points, APIs, batch/jobs, how to run, config, services, and operational notes. "
         "Use markdown. Cite file paths in backticks."
     )
-    for i, batch in enumerate(_batches(files), start=1):
+    batches = _batches(files)
+    if progress:
+        progress(0, len(batches) + 1, "reading source")
+    for i, batch in enumerate(batches, start=1):
+        if progress:
+            if progress(i - 1, len(batches) + 1, f"summarizing batch {i} of {len(batches)}") is False:
+                raise ScanCancelled()
         prompt = (
             f"Repository: {repo['name']} ({repo['kind']}: {repo['source']})\n"
             f"This is source batch {i}. Summarize key aspects from these files:\n\n{batch}"
@@ -154,6 +164,9 @@ def scan_repository(repo: dict) -> dict:
         f"{merged[:40000]}"
     )
     try:
+        if progress:
+            if progress(len(batches), len(batches) + 1, "writing handbook") is False:
+                raise ScanCancelled()
         handbook = _llm_complete(final_prompt, system, max_tokens=3500)
     except Exception:
         handbook = ""
@@ -180,7 +193,7 @@ def scan_repository(repo: dict) -> dict:
     scanned = database.now_iso()
     with database.db() as conn:
         conn.execute(
-            "UPDATE repos SET last_scanned_at = ?, last_indexed_at = ?, scan_doc_id = ? WHERE id = ?",
+            "UPDATE repos SET last_scanned_at = ?, last_indexed_at = ?, scan_doc_id = ?, scan_status = 'completed', scan_error = '' WHERE id = ?",
             (scanned, scanned, doc["id"], repo["id"]),
         )
         row = conn.execute("SELECT * FROM repos WHERE id = ?", (repo["id"],)).fetchone()

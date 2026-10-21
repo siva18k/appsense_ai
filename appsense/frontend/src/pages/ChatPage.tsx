@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import Markdown from "react-markdown";
 import { useParams, useSearchParams } from "react-router-dom";
 import {
@@ -33,6 +33,100 @@ type ChatMsg = {
   content: string;
 };
 
+type MarkdownCodeProps = {
+  inline?: boolean;
+  className?: string;
+  children?: ReactNode;
+};
+
+function codeText(children: ReactNode) {
+  return String(children ?? "").replace(/\n$/, "");
+}
+
+function StructuredArtifact({ language, source }: { language: string; source: string }) {
+  const normalized = language.toLowerCase();
+  if (normalized === "html" || normalized === "htm") {
+    return (
+      <div className="chat-artifact">
+        <div className="chat-artifact-label">html preview</div>
+        <iframe className="html-preview" title="HTML response preview" sandbox="" srcDoc={source} />
+        <details><summary>view source</summary><pre>{source}</pre></details>
+      </div>
+    );
+  }
+  if (normalized === "json" || normalized === "jsonc") {
+    let formatted = source;
+    try { formatted = JSON.stringify(JSON.parse(source), null, 2); } catch { /* keep source */ }
+    return <div className="chat-artifact"><div className="chat-artifact-label">json</div><pre>{formatted}</pre></div>;
+  }
+  if (normalized === "drawio" || normalized === "mxfile" || (normalized === "xml" && source.includes("<mxfile"))) {
+    return (
+      <div className="chat-artifact">
+        <div className="chat-artifact-label">draw.io diagram source</div>
+        <p className="muted">This response contains draw.io XML. Download or import the source in diagrams.net to edit the diagram.</p>
+        <pre>{source}</pre>
+      </div>
+    );
+  }
+  if (normalized === "mermaid") {
+    return <div className="chat-artifact"><div className="chat-artifact-label">diagram definition</div><pre>{source}</pre><p className="muted">Mermaid rendering can be enabled when the diagram package is added.</p></div>;
+  }
+  return <pre><code>{source}</code></pre>;
+}
+
+function MarkdownCode({ inline, className, children }: MarkdownCodeProps) {
+  const source = codeText(children);
+  const language = className?.match(/language-(\w+)/)?.[1];
+  if (inline || !language) return <code>{children}</code>;
+  return <StructuredArtifact language={language} source={source} />;
+}
+
+type ChatRuntime = {
+  activeId: string | null;
+  messages: ChatMsg[];
+  proposal: CommandProposal | null;
+  actionRequest: string;
+  cmdOutput: string;
+  cmdSummary: string;
+  activity: string;
+  busy: boolean;
+  running: boolean;
+};
+
+function runtimeKey(projectId: string) {
+  return `appsense-chat-runtime:${projectId}`;
+}
+
+function readRuntime(projectId?: string): ChatRuntime | null {
+  if (!projectId) return null;
+  try {
+    const raw = localStorage.getItem(runtimeKey(projectId));
+    return raw ? JSON.parse(raw) as ChatRuntime : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeRuntime(projectId: string | undefined, runtime: Partial<ChatRuntime>) {
+  if (!projectId) return;
+  const current = readRuntime(projectId) || {
+    activeId: null,
+    messages: [],
+    proposal: null,
+    actionRequest: "",
+    cmdOutput: "",
+    cmdSummary: "",
+    activity: "",
+    busy: false,
+    running: false,
+  };
+  localStorage.setItem(runtimeKey(projectId), JSON.stringify({ ...current, ...runtime }));
+}
+
+function clearRuntime(projectId?: string) {
+  if (projectId) localStorage.removeItem(runtimeKey(projectId));
+}
+
 export function ChatPage() {
   const { projectId } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -53,6 +147,8 @@ export function ChatPage() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [commands, setCommands] = useState<AllowCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
@@ -65,6 +161,24 @@ export function ChatPage() {
   function stopAction() {
     actionController.current?.abort();
     actionController.current = null;
+    setBusy(false);
+    setRunning(false);
+    setActivity("");
+  }
+
+  function showAssistant(text: string, onlyIfEmpty = false) {
+    setMessages((current) => {
+      const copy = [...current];
+      const last = copy[copy.length - 1];
+      if (last?.role === "assistant") {
+        if (!last.content.trim()) {
+          copy[copy.length - 1] = { ...last, content: text };
+          return copy;
+        }
+        if (onlyIfEmpty) return copy;
+      }
+      return [...copy, { role: "assistant", content: text }];
+    });
   }
 
   async function loadConversations(select?: string) {
@@ -89,6 +203,26 @@ export function ChatPage() {
       setHistoryOpen(true);
     } finally {
       setHistoryLoading(false);
+    }
+  }
+
+  async function clearHistory() {
+    if (!projectId || !conversations.length) return;
+    setClearBusy(true);
+    setHistoryError("");
+    try {
+      await api(`/api/projects/${projectId}/conversations`, { method: "DELETE" });
+      setConversations([]);
+      setMessages([]);
+      setActiveId(null);
+      setHistoryQuery("");
+      setHistoryOpen(false);
+      setClearConfirmOpen(false);
+      clearRuntime(projectId);
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : "Could not clear recent chats");
+    } finally {
+      setClearBusy(false);
     }
   }
 
@@ -122,19 +256,37 @@ export function ChatPage() {
     setCmdOutput("");
     setCmdSummary("");
     setTerminalOpen(false);
+    clearRuntime(projectId);
     setHistoryOpen(false);
     await loadConversations(conv.id);
   }
 
   useEffect(() => {
+    const runtime = readRuntime(projectId);
+    if (runtime) {
+      setActiveId(runtime.activeId);
+      setMessages(runtime.messages);
+      setProposal(runtime.proposal);
+      setActionRequest(runtime.actionRequest);
+      setCmdOutput(runtime.cmdOutput);
+      setCmdSummary(runtime.cmdSummary);
+      setActivity("");
+      setBusy(false);
+      setRunning(false);
+      setTerminalOpen(false);
+    } else {
+      setMessages([]);
+      setActiveId(null);
+      setProposal(null);
+      setActionRequest("");
+      setCmdOutput("");
+      setCmdSummary("");
+      setActivity("");
+      setBusy(false);
+      setRunning(false);
+      setTerminalOpen(false);
+    }
     loadConversations().catch(console.error);
-    setMessages([]);
-    setActiveId(null);
-    setProposal(null);
-    setActionRequest("");
-    setActiveSkillRun(false);
-    setCmdOutput("");
-    setCmdSummary("");
     setTerminalOpen(false);
     setHistoryOpen(false);
     setHistoryQuery("");
@@ -145,6 +297,20 @@ export function ChatPage() {
       api<AllowCommand[]>(`/api/projects/${projectId}/commands`).then(setCommands).catch(console.error);
     }
   }, [projectId]);
+
+  useEffect(() => {
+    writeRuntime(projectId, {
+      activeId,
+      messages,
+      proposal,
+      actionRequest,
+      cmdOutput,
+      cmdSummary,
+      activity,
+      busy,
+      running,
+    });
+  }, [projectId, activeId, messages, proposal, actionRequest, cmdOutput, cmdSummary, activity, busy, running]);
 
   useEffect(() => {
     const skillId = searchParams.get("skill");
@@ -234,18 +400,26 @@ export function ChatPage() {
     setCommandIndex(0);
   }
 
-  async function send(e?: FormEvent) {
+  async function send(e?: FormEvent, preset?: string) {
     e?.preventDefault();
-    if (!projectId || !input.trim() || busy) return;
-    const text = input.trim();
+    const text = (preset ?? input).trim();
+    if (!projectId || !text || busy) return;
     if (mode === "support" && text.startsWith("/")) setActiveSkillRun(true);
     setInput("");
     if (mode === "support" && text.startsWith("@")) {
+      const token = text.slice(1).trim().toLowerCase();
       const selected = commands.find(
-        (item) => skillSlug(item.name) === text.slice(1).toLowerCase() || item.name.toLowerCase() === text.slice(1).toLowerCase()
+        (item) => skillSlug(item.name) === token || item.name.toLowerCase() === token
       );
       if (selected) {
-        setMessages((m) => [...m, { role: "user", content: text }]);
+        setMessages((m) => [
+          ...m,
+          { role: "user", content: text },
+          {
+            role: "assistant",
+            content: `Ready to run ${selected.name}. Confirm the action below.`,
+          },
+        ]);
         setProposal({
           id: selected.id,
           name: selected.name,
@@ -288,9 +462,11 @@ export function ChatPage() {
           });
         }
         if (event.type === "command_proposal" && event.command) {
+          const next = event.command as CommandProposal;
           setActivity("preparing action");
           setActionRequest("");
-          setProposal(event.command as CommandProposal);
+          setProposal(next);
+          showAssistant(`Ready to run ${next.name}. Confirm the action below.`, true);
         }
         if (event.type === "error" && typeof event.text === "string") {
           setMessages((m) => {
@@ -304,8 +480,11 @@ export function ChatPage() {
         }
       });
       await loadConversations();
+      showAssistant("I could not produce a reply for that request. Try sending it again.", true);
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        showAssistant(error instanceof Error ? error.message : "The request failed before a reply was returned.");
+      }
     } finally {
       if (actionController.current === controller) actionController.current = null;
       setBusy(false);
@@ -332,9 +511,19 @@ export function ChatPage() {
       if (!res.ok) throw new Error(await res.text());
       await readSse(res, (event) => {
         if (event.type === "command_proposal" && event.command) {
+          const next = event.command as CommandProposal;
           setActivity("preparing next action");
-          setProposal(event.command as CommandProposal);
+          setProposal(next);
           setTerminalOpen(false);
+          if (!responseText.trim()) {
+            responseText = `Ready to run ${next.name}. Confirm the action below.`;
+            setMessages((current) => {
+              const copy = [...current];
+              const last = copy[copy.length - 1];
+              if (last?.role === "assistant") copy[copy.length - 1] = { ...last, content: responseText };
+              return copy;
+            });
+          }
         }
         if (event.type === "token" && typeof event.text === "string") {
           setActivity("writing response");
@@ -363,9 +552,10 @@ export function ChatPage() {
     setActivity("running command");
     setCmdOutput("");
     setCmdSummary("");
-    setTerminalOpen(false);
+    setTerminalOpen(true);
     const controller = new AbortController();
     actionController.current = controller;
+    let succeeded = false;
     try {
       const res = await fetch(`/api/projects/${projectId}/commands/run`, {
         method: "POST",
@@ -377,6 +567,7 @@ export function ChatPage() {
         }),
         signal: controller.signal,
       });
+      if (!res.ok) throw new Error(await res.text());
       await readSse(res, (event) => {
         if (event.type === "output" && typeof event.text === "string") {
           setCmdOutput((s) => s + event.text);
@@ -390,24 +581,31 @@ export function ChatPage() {
         if (event.type === "summary" && typeof event.text === "string") {
           setActivity("summarizing result");
           setCmdSummary(event.text);
+          showAssistant(event.text);
         }
         if (event.type === "error" && typeof event.text === "string") {
           setCmdOutput((s) => s + event.text);
+          showAssistant(event.text);
         }
       });
+      succeeded = true;
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === "AbortError")) throw error;
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        showAssistant(error instanceof Error ? error.message : "The command failed before it returned a result.");
+      }
     } finally {
       if (actionController.current === controller) actionController.current = null;
       setRunning(false);
       setActivity("");
-      setProposal(null);
-      setCmdOutput("");
-      setCmdSummary("");
-      setTerminalOpen(false);
-      setActionRequest("");
-      if (activeId) await openConversation(activeId);
-      if (activeSkillRun && !controller.signal.aborted) await continueSkill();
+      if (succeeded) {
+        setProposal(null);
+        setCmdOutput("");
+        setCmdSummary("");
+        setTerminalOpen(false);
+        setActionRequest("");
+        if (activeId) await openConversation(activeId);
+        if (activeSkillRun && !controller.signal.aborted) await continueSkill();
+      }
     }
   }
 
@@ -520,6 +718,18 @@ export function ChatPage() {
                   placeholder="Search chats"
                   autoFocus
                 />
+                <div className="history-actions">
+                  <button type="button" className="subtle" onClick={() => setClearConfirmOpen(true)} disabled={!conversations.length}>
+                    Clear
+                  </button>
+                </div>
+                {clearConfirmOpen && (
+                  <div className="history-confirm">
+                    <span>Clear all chats?</span>
+                    <button type="button" className="subtle" onClick={() => setClearConfirmOpen(false)} disabled={clearBusy}>Cancel</button>
+                    <button type="button" className="danger" onClick={clearHistory} disabled={clearBusy}>{clearBusy ? "Clearing…" : "Clear"}</button>
+                  </div>
+                )}
                 <div className="history-scroll">
                   {historyError && <p className="muted history-error">{historyError}</p>}
                   {historyGroups.length === 0 && (
@@ -572,7 +782,7 @@ export function ChatPage() {
             ) : (
               <div className="markdown">
                 {m.content ? (
-                  <Markdown>{m.content}</Markdown>
+                  <Markdown components={{ code: MarkdownCode }}>{m.content}</Markdown>
                 ) : busy && i === messages.length - 1 ? (
                   <span className="activity-label">{activity}</span>
                 ) : null}
@@ -652,9 +862,14 @@ export function ChatPage() {
                   setCommandIndex((i) => (i - 1 + commandMatches.length) % commandMatches.length);
                   return;
                 }
-                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                if (e.key === "Tab") {
                   e.preventDefault();
                   applyCommand(commandMatches[commandIndex]);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send(undefined, `@${skillSlug(commandMatches[commandIndex].name)}`);
                   return;
                 }
               }
@@ -669,9 +884,14 @@ export function ChatPage() {
                   setSlashIndex((i) => (i - 1 + slashMatches.length) % slashMatches.length);
                   return;
                 }
-                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                if (e.key === "Tab") {
                   e.preventDefault();
                   applySkill(slashMatches[slashIndex]);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void send(undefined, `/${skillSlug(slashMatches[slashIndex].name)}`);
                   return;
                 }
                 if (e.key === "Escape") {
